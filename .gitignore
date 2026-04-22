@@ -11,8 +11,10 @@ dist/
 dashboard-ui/dist/
 
 # Data
+# Se permite subir trades.db a petición del usuario (Repositorio Privado)
+!data/*.db
+!data/*.csv
 data/
-*.db
 *.db-journal
 scalper_state*.json
 
