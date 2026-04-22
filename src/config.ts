@@ -25,7 +25,7 @@ if (!config.bitso.key || !config.bitso.secret) {
  */
 export const SCALING_CONFIG = {
     slotThresholds: [
-        { minCapital: 0.0132, slots: 1 },
+        { minCapital: 0.0100, slots: 1 },
         { minCapital: 0.0264, slots: 2 },
         { minCapital: 0.0528, slots: 4 },
         { minCapital: 0.1056, slots: 6 },

@@ -17,7 +17,7 @@ import { ProductionGridBot, BotConfig } from './ProductionGridBot';
 import { tradeDB } from './AsyncTradeDB';
 import { isPortAvailable } from './utils/portChecker';
 import { telegram } from './utils/TelegramManager';
-import { startWebSocketServer } from './ws-server';
+import { startWebSocketServer, stopWebSocketServer } from './ws-server';
 
 async function main() {
     // 🔥 REGISTRAR HANDLERS PRIMERO (antes de cualquier async)
@@ -37,7 +37,7 @@ async function main() {
         console.log(`[DEBUG] Process exiting with code: ${code}`);
     });
 
-    console.log('🚀 SLAVI Production Suite v2.0 - BINANCE BNB STRATEGY');
+    console.log('🚀 SLAVI v2.2.0 (2026-04-22) - BINANCE BNB STRATEGY');
     console.log('🎯 Config: Base BNB | Top 10 Vol | Target +0.3% | Fee 0.075%');
 
     let bot: ProductionGridBot | null = null;
@@ -90,7 +90,7 @@ async function main() {
             pairCount: 1,
             targetProfit: 0.003,
             commissionRate: 0.00075,
-            orderSizeBNB: 0.0120,
+            orderSizeBNB: 0.0105,
             wsEnabled: true,
             trailingStop: {
                 basePercent: 0.002,
@@ -101,11 +101,12 @@ async function main() {
         };
         
         bot = new ProductionGridBot(exchange, tradeDB, botConfig);
+        await bot.initialize();
 
         // 3.5 Iniciar Servidor WebSocket Antigravity
         startWebSocketServer(8080);
 
-        bot.start();
+        await bot.start();
 
         // 🚀 Alerta de Telegram: Sistema Online
         if (telegram.isEnabled()) {
@@ -124,13 +125,43 @@ async function main() {
         }, 10000);
 
         // Manejo de cierre limpio
-        process.on('SIGINT', async () => {
-            console.log('\n🛑 Apagando bots...');
+        const shutdown = async () => {
+            console.log('\n🛑 Apagando bots y liberando puertos...');
             clearInterval(heartbeat);
-            if (bot) await bot.stop();
-            if (exchange) exchange.disconnectWebSocket();
+            try {
+                if (bot) await bot.stop();
+                await stopWebSocketServer();
+                if (exchange) exchange.disconnectWebSocket();
+            } catch (e) {
+                console.error('[Shutdown] Error during cleanup:', e);
+            }
+            console.log('✅ Shutdown complete.');
             process.exit(0);
-        });
+        };
+
+        process.on('SIGINT', shutdown);
+        process.on('SIGTERM', shutdown);
+
+        // --- BALANCE CACHE (Tarea 4 v2.2) ---
+        let balanceCache = { bnb: 0, lastUpdate: 0 };
+        const BALANCE_CACHE_SECONDS = 60;
+
+        const getAvailableBalance = async (): Promise<number> => {
+            const now = Date.now();
+            if (now - balanceCache.lastUpdate < BALANCE_CACHE_SECONDS * 1000) {
+                return balanceCache.bnb;
+            }
+            
+            try {
+                const balances = await exchange!.getBalance();
+                const bnb = balances.find((b: any) => b.asset === 'BNB')?.free || 0;
+                balanceCache = { bnb, lastUpdate: now };
+                return bnb;
+            } catch (e) {
+                console.warn('[Balance] Failed to fetch live balance, using cache.');
+                return balanceCache.bnb;
+            }
+        };
 
         // 🔥 ANCLA FINAL
         process.stdin.resume();

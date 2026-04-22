@@ -3,8 +3,6 @@ import * as path from 'path';
 import http from 'http';
 import express from 'express';
 import { Server } from 'socket.io';
-import { telegram } from './utils/TelegramManager';
-import { broadcastToDashboard } from './ws-server';
 
 interface BalanceInfo {
     asset: string;
@@ -33,14 +31,49 @@ interface TradeStats {
     profitPercent: string;
 }
 
-/**
- * Enhanced SLAVI Dashboard Server
- * Features: Real-time all-coin balances, CSV export, trade history
- */
+interface ActivePairState {
+    pair: string;
+    state: string;
+    entryPrice: number;
+    currentPrice: number;
+    currentProfitPct: number;
+    peakProfitPct: number;
+    targetProfitPct?: number;
+    trailingStopActive: boolean;
+    trailingThresholdPct: number;
+    holdDurationMinutes: number;
+    lastUpdate: Date;
+}
+
+interface OpenOrder {
+    orderId: string;
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    type: string;
+    price: number;
+    origQty: number;
+    executedQty: number;
+    status: string;
+    time: number;
+}
+
+interface GlobalKPIs {
+    winRate: number;
+    profitFactor: number;
+    avgHoldTimeMinutes: number;
+    maxDrawdownPct: number;
+    sharpeRatio: number;
+    totalTrades: number;
+    winningTrades: number;
+    losingTrades: number;
+    avgProfitPerWin: number;
+    avgLossPerLose: number;
+}
+
 export class DashboardServer {
-    private port = 3333;
+    private port = 3334;
     private stats: any = {
-        status: 'BOOTING',
+        status: 'LIVE',
         startTime: new Date(),
         exchanges: {} as Record<string, ExchangeData>,
         logs: [] as string[],
@@ -52,13 +85,21 @@ export class DashboardServer {
             netProfit: '0.00',
             profitPercent: '0.00'
         } as TradeStats,
-        totalPortfolioValue: '0.000000',
-        availablePortfolioValue: '0.000000',
-        managerStatus: 'Initializing...',
-        strategyStates: {} as Record<string, any>,
+        totalPortfolioValue: '0.00',
+        totalPortfolioBNB: '0.0000',
+        totalPortfolioMXN: '0.00',
+        availablePortfolioValue: '0.00',
+        managerStatus: 'Running',
+        strategyStates: {} as Record<string, ActivePairState>,
+        activeOrders: [] as OpenOrder[],
+        globalKPIs: {
+            winRate: 0, profitFactor: 0, avgHoldTimeMinutes: 0, maxDrawdownPct: 0,
+            sharpeRatio: 0, totalTrades: 0, winningTrades: 0, losingTrades: 0,
+            avgProfitPerWin: 0, avgLossPerLose: 0
+        } as GlobalKPIs,
         priceHistory: [] as { timestamp: number; exchange: string; price: number; marker?: 'buy' | 'sell' }[],
         recentTrades: [] as any[],
-        hodlMode: true // HODL Mode ON by default — only sells at profit target
+        hodlMode: false
     };
     private logsDir: string;
     private priceHistoryFile: string;
@@ -67,7 +108,7 @@ export class DashboardServer {
     private io: any;
     private lastBroadcast = 0;
 
-    constructor(port = 3333) {
+    constructor(port = 3334) {
         this.port = port;
         this.logsDir = path.join(process.cwd(), 'logs');
         this.priceHistoryFile = path.join(this.logsDir, 'price_history.json');
@@ -76,18 +117,39 @@ export class DashboardServer {
             fs.mkdirSync(this.logsDir, { recursive: true });
         }
 
-        // Initialize Express + Socket.IO
         this.app = express();
         this.server = http.createServer(this.app);
-        this.io = new Server(this.server, {
-            cors: { origin: "*", methods: ["GET", "POST"] }
-        });
+        this.io = new Server(this.server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
         this.setupRoutes();
         this.setupSockets();
-
-        // Load price history from disk
         this.loadPriceHistory();
+    }
+
+    public async start(tradeLogger?: any) {
+        return new Promise<void>((resolve, reject) => {
+            this.server.listen(this.port, '0.0.0.0', () => {
+                console.log(`[Dashboard] 🚀 Dashboard Server Active at http://localhost:${this.port}`);
+                resolve();
+            });
+
+            this.server.on('error', (err: any) => {
+                if (err.code === 'EADDRINUSE') {
+                    console.error(`[Dashboard] ❌ Port ${this.port} is already in use.`);
+                    reject(err);
+                } else {
+                    reject(err);
+                }
+            });
+        });
+    }
+
+    public async stop(): Promise<void> {
+        if (this.io) this.io.close();
+        return new Promise((resolve) => {
+            if (this.server) this.server.close(() => resolve());
+            else resolve();
+        });
     }
 
     private loadPriceHistory() {
@@ -95,858 +157,402 @@ export class DashboardServer {
             if (fs.existsSync(this.priceHistoryFile)) {
                 const data = JSON.parse(fs.readFileSync(this.priceHistoryFile, 'utf8'));
                 this.stats.priceHistory = data.priceHistory || [];
-                console.log(`[Dashboard] Loaded ${this.stats.priceHistory.length} price history entries`);
             }
-        } catch (e: any) {
-            console.error('[Dashboard] Failed to load price history:', e.message);
-        }
+        } catch (e) { }
     }
 
     private savePriceHistory() {
         try {
             fs.writeFileSync(this.priceHistoryFile, JSON.stringify({
-                priceHistory: this.stats.priceHistory.slice(-500) // Keep last 500 entries
+                priceHistory: this.stats.priceHistory.slice(-500)
             }));
-        } catch (e: any) {
-            // Silently fail, we don't want to spam logs
+        } catch (e) { }
+    }
+
+    recalculateTotalPortfolio(prices?: Map<string, number>) {
+        let totalUSD = 0;
+        if (prices) {
+            prices.forEach((price, symbol) => {
+                this.stats.priceHistory.push({ timestamp: Date.now(), exchange: symbol, price: price });
+            });
+            if (this.stats.priceHistory.length > 1000) this.stats.priceHistory = this.stats.priceHistory.slice(-1000);
         }
-    }
 
-    updateTotalPortfolioValue(total: string, available: string) {
-        this.stats.totalPortfolioValue = total;
-        this.stats.availablePortfolioValue = available;
-    }
-
-    updateManagerStatus(status: string) {
-        this.stats.managerStatus = status;
-    }
-
-    recalculateTotalPortfolio() {
-        let totalValue = 0;
-        let btcPrice = 0;
-        let xrpPrice = 0;
-        let ethPrice = 0;
-        let solPrice = 0;
-
-        // Try to find price in history (search recent backwards if possible, but find returns first which is oldest if not sorted. Assuming it's latest at the end, find might get the old one. We'll use reverse just in case, but let's stick to existing logic for now, or use reduce/reverse)
-        // Wait, priceHistory is pushed to, so the latest is at the end. find() from start gives earliest.
-        // Let's use reverse() to get the latest easily
         const historyCopy = [...this.stats.priceHistory].reverse();
+        const getPrice = (symbol: string) => {
+            if (prices?.has(symbol)) return prices.get(symbol)!;
+            const hist = historyCopy.find((p: any) => p.exchange.includes(symbol));
+            return hist ? hist.price : 0;
+        };
 
-        const btcHist = historyCopy.find((p: any) => p.exchange.includes('BTC'));
-        if (btcHist) btcPrice = btcHist.price;
+        const bnbPrice = getPrice('BNBUSDT') || getPrice('BNB');
+        const mxnUsd = 1 / (getPrice('USDMXN') || getPrice('MXNUSD') || 19.50);
 
-        const xrpHist = historyCopy.find((p: any) => p.exchange.includes('XRP'));
-        if (xrpHist) xrpPrice = xrpHist.price;
-
-        const ethHist = historyCopy.find((p: any) => p.exchange.includes('ETH'));
-        if (ethHist) ethPrice = ethHist.price;
-
-        const solHist = historyCopy.find((p: any) => p.exchange.includes('SOL'));
-        if (solHist) solPrice = solHist.price;
-
-        // Sum up balances
         for (const exName of Object.keys(this.stats.exchanges)) {
             const ex = this.stats.exchanges[exName];
             if (ex && ex.balances) {
                 ex.balances.forEach((b: BalanceInfo) => {
-                    // Stablecoins
-                    if (b.asset === 'USD' || b.asset === 'USDT' || b.asset === 'USDC' || b.asset === 'BUSD' || b.asset === 'FDUSD') {
-                        totalValue += b.total;
-                    }
-                    else if (b.asset === 'MXN') {
-                        totalValue += b.total / 20.50;
-                    }
-                    // Crypto
+                    let assetUsd = 0;
+                    if (['USD','USDT','USDC','BUSD','FDUSD'].includes(b.asset)) assetUsd = b.total;
+                    else if (b.asset === 'MXN') assetUsd = b.total * mxnUsd;
+                    else if (b.asset === 'BNB') assetUsd = b.total * bnbPrice;
                     else {
-                        if (b.asset === 'BTC' && btcPrice > 0) totalValue += b.total * btcPrice;
-                        else if (b.asset === 'XRP' && xrpPrice > 0) totalValue += b.total * xrpPrice;
-                        else if (b.asset === 'ETH' && ethPrice > 0) totalValue += b.total * ethPrice;
-                        else if (b.asset === 'SOL' && solPrice > 0) totalValue += b.total * solPrice;
+                        const direct = historyCopy.find(p => p.exchange === `${b.asset}USDT` || p.exchange === `${b.asset}USD`);
+                        if (direct) assetUsd = b.total * direct.price;
+                        else {
+                            const bnbPair = historyCopy.find(p => p.exchange === `${b.asset}BNB`);
+                            if (bnbPair) assetUsd = b.total * bnbPair.price * bnbPrice;
+                            else {
+                                const anyP = getPrice(b.asset);
+                                if (anyP > 0) assetUsd = b.total * anyP;
+                            }
+                        }
                     }
+                    b.usdValue = assetUsd;
+                    totalUSD += assetUsd;
                 });
             }
         }
 
-        this.stats.totalPortfolioValue = totalValue.toFixed(2);
-        this.stats.availablePortfolioValue = totalValue.toFixed(2);
+        this.stats.totalPortfolioValue = totalUSD.toFixed(2);
+        this.stats.totalPortfolioBNB = (bnbPrice > 0 ? totalUSD / bnbPrice : 0).toFixed(4);
+        this.stats.totalPortfolioMXN = (mxnUsd > 0 ? totalUSD / mxnUsd : 0).toFixed(2);
+        this.stats.availablePortfolioValue = totalUSD.toFixed(2);
+        this.broadcastState();
     }
 
     private setupRoutes() {
-        // API Stats
-        this.app.get('/api/stats', (req: any, res: any) => {
-            res.json(this.stats);
-        });
-
-        this.app.get('/api/balances', (req: any, res: any) => {
-            res.json(this.stats.exchanges);
-        });
-
-        this.app.get('/api/export-csv', async (req: any, res: any) => {
-            // Need a way to access tradeLogger. For now, we'll assume it's passed or used via event bus.
-            // Simplified for now based on previous logic.
-            res.status(500).send('Exporter needs tradeLogger instance');
-        });
-
-        this.app.get('/api/logs', (req: any, res: any) => {
-            const logPath = path.join(this.logsDir, 'bot.log');
-            if (fs.existsSync(logPath)) {
-                res.download(logPath, 'slavi_bot.log');
-            } else {
-                res.status(404).send('No logs yet');
-            }
-        });
-
+        this.app.get('/api/stats', (req: any, res: any) => res.json(this.stats));
         this.app.get('/api/toggle-hodl', (req: any, res: any) => {
             this.stats.hodlMode = !this.stats.hodlMode;
-            console.log(`[Dashboard] HODL Mode is now ${this.stats.hodlMode ? 'ON' : 'OFF'}`);
             res.json({ hodlMode: this.stats.hodlMode });
             this.broadcastState();
         });
-
-        this.app.get('/api/hodl-status', (req: any, res: any) => {
-            res.json({ hodlMode: this.stats.hodlMode });
+        this.app.get('/api/logs', (req: any, res: any) => {
+            const logPath = path.join(this.logsDir, 'bot.log');
+            if (fs.existsSync(logPath)) res.download(logPath);
+            else res.status(404).send('No logs');
         });
-
-        // Serve Dashboard UI (Production Build)
-        const uiPath = path.join(process.cwd(), 'dashboard-ui', 'dist');
-        if (fs.existsSync(uiPath)) {
-            this.app.use(express.static(uiPath));
-            this.app.get(/.*/, (req: any, res: any) => {
-                if (!req.url.startsWith('/api')) {
-                    res.sendFile(path.join(uiPath, 'index.html'));
-                }
-            });
-        } else {
-            // Fallback for when UI is not built
-            this.app.get('/', (req: any, res: any) => {
-                res.send(this.getEnhancedHtml());
-            });
-        }
+        this.app.get('/', (req: any, res: any) => res.send(this.getEnhancedHtml()));
     }
 
     private setupSockets() {
-        this.io.on('connection', (socket: any) => {
-            console.log(`[Socket] New connection: ${socket.id}`);
-            socket.emit('state', this.stats);
-            
-            socket.on('disconnect', () => {
-                console.log(`[Socket] Disconnected: ${socket.id}`);
-            });
-        });
+        this.io.on('connection', (socket: any) => socket.emit('state', this.stats));
     }
 
     private broadcastState() {
         const now = Date.now();
-        if (now - this.lastBroadcast < 1000) return; // Throttle to 1s
+        if (now - this.lastBroadcast < 1000) return;
         this.lastBroadcast = now;
         this.io.emit('state', this.stats);
     }
 
-    start(tradeLogger?: any) {
-        // Allow dynamic export if logger provided
-        this.app.get('/api/export-csv-direct', async (req: any, res: any) => {
-            if (tradeLogger) {
-                const content = await tradeLogger.getCSVContent();
-                res.header('Content-Type', 'text/csv');
-                res.header('Content-Disposition', 'attachment; filename="slavi_trades.csv"');
-                res.send(content);
-            } else {
-                res.status(500).send('Logger not active');
-            }
-        });
-
-        this.server.listen(this.port, '0.0.0.0', () => {
-            console.log(`🌍 Dashboard Active at http://localhost:${this.port}`);
-            console.log(`📊 WebSocket ready on same port.`);
-        });
+    isHodlModeActive(): boolean { return this.stats.hodlMode; }
+    updateManagerStatus(status: string) { this.stats.managerStatus = status; this.broadcastState(); }
+    updateAllBalances(exchangeName: string, balances: BalanceInfo[], connected: boolean = true) {
+        this.stats.exchanges[exchangeName] = { name: exchangeName, connected, balances, activeOrders: 0, lastUpdate: new Date() };
+        this.recalculateTotalPortfolio();
     }
-
-    public isHodlModeActive(): boolean {
-        return this.stats.hodlMode === true;
-    }
-
-    /**
-     * Update all balances for an exchange
-     */
-    updateAllBalances(exchangeName: string, balances: BalanceInfo[], connected: boolean = true, error?: string) {
-        if (!this.stats.exchanges[exchangeName]) {
-            this.stats.exchanges[exchangeName] = {
-                name: exchangeName,
-                connected: false,
-                balances: [],
-                activeOrders: 0,
-                lastUpdate: new Date()
-            };
-        }
-
-        this.stats.exchanges[exchangeName].connected = connected;
-        this.stats.exchanges[exchangeName].balances = balances;
-        this.stats.exchanges[exchangeName].lastUpdate = new Date();
-        if (error) {
-            this.stats.exchanges[exchangeName].error = error;
-        }
-        this.broadcastState();
-    }
-
-    updateExchangeStats(name: string, balance: any, activeOrders: number, lastPrice: number, openOrdersList: any[] = [], orderBook: any = null) {
-        if (!this.stats.exchanges[name]) {
-            this.stats.exchanges[name] = {
-                name: name,
-                connected: true,
-                balances: [],
-                activeOrders: 0,
-                lastUpdate: new Date()
-            };
-        }
-        this.stats.exchanges[name].activeOrders = activeOrders;
-        this.stats.exchanges[name].openOrdersList = openOrdersList;
-        if (orderBook) this.stats.exchanges[name].orderBook = orderBook;
-        this.stats.exchanges[name].lastUpdate = new Date();
-
-        // Legacy single balance update
-        if (balance && balance.asset) {
-            const existing = this.stats.exchanges[name].balances.find((b: BalanceInfo) => b.asset === balance.asset);
-            if (existing) {
-                existing.free = balance.free;
-                existing.locked = balance.locked || 0;
-                existing.total = balance.total || balance.free;
-            } else {
-                this.stats.exchanges[name].balances.push(balance);
-            }
-        }
-        this.broadcastState();
-    }
-
-    updateRecentTrades(trades: any[]) {
-        this.stats.recentTrades = trades;
-        this.broadcastState();
-    }
-
-    updateTradeStats(stats: TradeStats) {
-        this.stats.tradeStats = stats;
-        this.broadcastState();
-    }
-
-    updateSentiment(sentiment: any) {
-        this.stats.aiSentiment = sentiment;
-    }
-
-    updateStrategyState(exchange: string, state: any) {
-        this.stats.strategyStates[exchange] = state;
-    }
-
+    updateRecentTrades(trades: any[]) { this.stats.recentTrades = trades; this.broadcastState(); }
+    updateTradeStats(stats: TradeStats) { this.stats.tradeStats = stats; this.broadcastState(); }
+    updateActivePairState(pair: string, state: ActivePairState) { this.stats.strategyStates[pair] = state; this.broadcastState(); }
+    updateStrategyState(pair: string, state: any) { this.stats.strategyStates[pair] = state; this.broadcastState(); }
+    updateActiveOrders(orders: OpenOrder[]) { this.stats.activeOrders = orders; this.broadcastState(); }
+    updateGlobalKPIs(kpis: GlobalKPIs) { this.stats.globalKPIs = kpis; this.broadcastState(); }
     updatePrice(exchange: string, price: number) {
-        this.stats.priceHistory.push({
-            timestamp: Date.now(),
-            exchange,
-            price
-        });
-        // console.log(`[Dashboard] Price Update: ${exchange} $${price}`);
-        // Keep last 500 entries to match persistence
-        if (this.stats.priceHistory.length > 500) {
-            this.stats.priceHistory.shift();
-        }
-        // Save to disk every 10 updates (to avoid too many writes)
-        if (this.stats.priceHistory.length % 10 === 0) {
-            this.savePriceHistory();
-        }
+        this.stats.priceHistory.push({ timestamp: Date.now(), exchange, price });
+        if (this.stats.priceHistory.length > 500) this.stats.priceHistory.shift();
         this.broadcastState();
     }
-
-    addTradeMarker(exchange: string, type: 'buy' | 'sell', price: number) {
-        this.stats.priceHistory.push({
-            timestamp: Date.now(),
-            exchange,
-            price,
-            marker: type
-        });
-    }
-
     log(message: string) {
-        console.log(`[Bot] ${message}`);
         const timestamp = new Date().toLocaleTimeString();
         this.stats.logs.unshift(`[${timestamp}] ${message}`);
-        if (this.stats.logs.length > 100) this.stats.logs.pop();
-
-        // Also write to file
-        const logLine = `[${new Date().toISOString()}] ${message}\n`;
-        const logPath = path.join(this.logsDir, 'bot.log');
-        fs.appendFileSync(logPath, logLine);
+        if (this.stats.logs.length > 50) this.stats.logs.pop();
         this.broadcastState();
-        broadcastToDashboard({ log: message });
     }
-
     logStrategy(message: string) {
-        console.log(`[Strategy] ${message}`);
         const timestamp = new Date().toLocaleTimeString();
         this.stats.strategyLogs.unshift(`[${timestamp}] ${message}`);
-        if (this.stats.strategyLogs.length > 100) this.stats.strategyLogs.pop();
+        if (this.stats.strategyLogs.length > 50) this.stats.strategyLogs.pop();
         this.broadcastState();
-        broadcastToDashboard({ log: `[Strategy] ${message}` });
     }
 
-    private getRecentTradesHtml(): string {
-        if (!this.stats.recentTrades || this.stats.recentTrades.length === 0) {
-            return `
-                <div class="card" style="margin-top: 20px;">
-                    <h3 style="color: #0088ff; margin-bottom: 10px;">📜 Historial de Transacciones</h3>
-                    <p style="color:#888;">No hay transacciones recientes.</p>
-                </div>
-            `;
-        }
-        
-        const rows = [...this.stats.recentTrades].reverse().map((t: any) => `
-            <tr>
-                <td style="color:#888;">${new Date(t.timestamp).toLocaleTimeString()}</td>
-                <td><strong>${t.symbol}</strong></td>
-                <td style="color: ${t.side === 'BUY' ? '#00ff88' : '#ff4444'}; font-weight: bold;">${t.side}</td>
-                <td>$${t.price}</td>
-                <td>${t.amount}</td>
-                <td><strong>$${t.total.toFixed(2)}</strong></td>
-            </tr>
-        `).join('');
-
-        return `
-            <div class="card" style="margin-top: 20px;">
-                <h3 style="color: #0088ff; margin-bottom: 10px;">📜 Historial de Transacciones (Últimas 15)</h3>
-                <div class="balance-table-wrapper">
-                    <table class="balance-table" style="font-size: 0.9em;">
-                        <thead>
-                            <tr><th>Hora</th><th>Par</th><th>Lado</th><th>Precio</th><th>Monto</th><th>Total</th></tr>
-                        </thead>
-                        <tbody>${rows}</tbody>
-                    </table>
-                </div>
-            </div>
-        `;
-    }
-
-    private getEnhancedHtml() {
+    private getEnhancedHtml(): string {
         const uptime = Math.floor((Date.now() - new Date(this.stats.startTime).getTime()) / 60000);
+        const hodl = this.stats.hodlMode;
+        const trades = this.stats.recentTrades || [];
+        const activePairs = Object.values(this.stats.strategyStates) as ActivePairState[];
+        const activeOrders = this.stats.activeOrders || [];
 
-        // Build exchange cards with ALL balances
-        let exchangeCards = '';
-        for (const exName of Object.keys(this.stats.exchanges)) {
-            const ex = this.stats.exchanges[exName];
+        const activePairsRows = Object.entries(this.stats.strategyStates || {}).map(
+          ([pair, s]: [string, any]) => {
+            const entry = Number(s?.entryPrice || 0);
+            const current = Number(s?.currentPrice || 0);
+            
+            // Multiplicamos por 100 asumiendo que el bot envía valores decimales (ej. -0.0015 = -0.15%)
+            // Si el bot ya los envía multiplicados por 100, entonces quita los * 100 de abajo
+            const currentProfitPct = (Number(s?.currentProfitPct || 0)) * 100;
+            const peakProfitPct = (Number(s?.peakProfitPct || 0)) * 100;
+            const holdMinutes = Number(s?.holdDurationMinutes || 0);
+            
+            // El target neto es 0.15% (0.30% bruto - 0.15% comisiones)
+            const targetProfitPct = 0.15;
 
-            let balanceRows = '';
-            if (ex.balances && ex.balances.length > 0) {
-                // Filter only non-zero balances
-                const activeBalances = ex.balances.filter((b: BalanceInfo) => b.total > 0);
+            // Delta = Target - Current. Ej: 0.15 - (-0.15) = 0.30 (Falta un 0.30% para llegar)
+            const deltaToTargetPct = targetProfitPct - currentProfitPct;
 
-                if (activeBalances.length > 0) {
-                    balanceRows = activeBalances.map((b: BalanceInfo) => `
-                        <tr>
-                            <td><strong>${b.asset}</strong></td>
-                            <td>${b.free.toFixed(6)}</td>
-                            <td>${b.locked.toFixed(6)}</td>
-                            <td><strong>${b.total.toFixed(6)}</strong></td>
-                        </tr>
-                    `).join('');
-                } else {
-                    balanceRows = '<tr><td colspan="4" style="text-align:center; color:#666;">No active balances found (all 0.00)</td></tr>';
-                }
-            } else {
-                balanceRows = '<tr><td colspan="4">No balances loaded</td></tr>';
-            }
+            const pnlColor =
+              currentProfitPct > 0 ? 'var(--green)' :
+              currentProfitPct < 0 ? 'var(--red)' :
+              'var(--muted)';
 
-            const statusColor = ex.connected ? '#00ff88' : '#ff4444';
-            const statusText = ex.connected ? '● Connected' : '✗ ' + (ex.error || 'Disconnected');
+            // Delta color: Verde si falta poco o ya se pasó, amarillo/naranja si falta regular, rojo si falta mucho
+            const deltaColor =
+              deltaToTargetPct <= 0 ? 'var(--green)' : 
+              deltaToTargetPct <= 0.15 ? 'var(--yellow)' : 'var(--red)';
 
-            let ordersHtml = '';
-            if (ex.openOrdersList && ex.openOrdersList.length > 0) {
-                const rows = ex.openOrdersList.map((o: any) => `
-                    <tr>
-                         <td>${o.side.toUpperCase()}</td>
-                         <td>${o.price}</td>
-                         <td>${o.amount}</td>
-                         <td>${new Date(o.createdAt).toLocaleTimeString()}</td>
-                    </tr>
-                `).join('');
+            const stateLabel =
+              s?.status ||
+              s?.state ||
+              (entry > 0 ? 'ACTIVE' : 'SCANNING');
 
-                ordersHtml = `
-                    <div style="margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 10px;">
-                        <h4 style="color: #00ff88; margin-bottom: 5px;">Active Orders (${ex.openOrdersList.length})</h4>
-                        <table class="balance-table" style="font-size: 0.9em;">
-                            <thead>
-                                <tr><th>Side</th><th>Price</th><th>Amount</th><th>Time</th></tr>
-                            </thead>
-                            <tbody>${rows}</tbody>
-                        </table>
-                    </div>
-                `;
-            } else {
-                ordersHtml = `<div style="margin-top: 10px; font-size: 0.9em; color: #666;">No active orders</div>`;
-            }
-
-            let marketBookHtml = '';
-            if (ex.orderBook) {
-                const bids = ex.orderBook.bids.slice(0, 5).map((o: any) => {
-                    const price = parseFloat(o.price);
-                    const amount = parseFloat(o.amount);
-                    return `<div style="color:#00ff88">${isNaN(price) ? '-' : price.toFixed(5)} (${isNaN(amount) ? '-' : amount.toFixed(2)})</div>`;
-                }).join('');
-                const asks = ex.orderBook.asks.slice(0, 5).map((o: any) => {
-                    const price = parseFloat(o.price);
-                    const amount = parseFloat(o.amount);
-                    return `<div style="color:#ff4444">${isNaN(price) ? '-' : price.toFixed(5)} (${isNaN(amount) ? '-' : amount.toFixed(2)})</div>`;
-                }).join('');
-
-                marketBookHtml = `
-                    <div style="margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 10px;">
-                        <h4 style="color: #aaa; margin-bottom: 5px;">Market Order Book</h4>
-                        <div style="display:flex; justify-content:space-between; font-size:0.85em;">
-                            <div style="width:48%">
-                                <div style="border-bottom:1px solid #333; margin-bottom:2px;">BIDS (Buy)</div>
-                                ${bids}
-                            </div>
-                            <div style="width:48%; text-align:right;">
-                                <div style="border-bottom:1px solid #333; margin-bottom:2px;">ASKS (Sell)</div>
-                                ${asks}
-                            </div>
-                        </div>
-                    </div>
-                `;
-            }
-
-            exchangeCards += `
-                <div class="card exchange-card">
-                    <div class="card-header">
-                        <h2>${exName}</h2>
-                        <span style="color: ${statusColor}">${statusText}</span>
-                    </div>
-                    <div class="balance-table-wrapper">
-                        <table class="balance-table">
-                            <thead>
-                                <tr>
-                                    <th>Asset</th>
-                                    <th>Available</th>
-                                    <th>Locked</th>
-                                    <th>Total</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${balanceRows}
-                            </tbody>
-                        </table>
-                    </div>
-                    ${ordersHtml}
-                    ${marketBookHtml}
-                    <div class="card-footer">
-                        Last Update: ${new Date(ex.lastUpdate).toLocaleTimeString()}
-                    </div>
-                </div>
+            return `
+              <tr>
+                <td><strong>${pair}</strong></td>
+                <td style="color: var(--accent)">${stateLabel}</td>
+                <td>${entry > 0 ? entry.toFixed(6) : '—'}</td>
+                <td>${current > 0 ? current.toFixed(6) : '—'}</td>
+                <td>+${targetProfitPct.toFixed(2)}%</td>
+                <td style="color:${pnlColor}">${currentProfitPct.toFixed(2)}%</td>
+                <td style="color:${deltaColor}">
+                  ${deltaToTargetPct > 0 ? '+' : ''}${deltaToTargetPct.toFixed(2)}%
+                </td>
+                <td style="color:${peakProfitPct >= 0 ? 'var(--green)' : 'var(--red)'}">
+                  ${peakProfitPct.toFixed(2)}%
+                </td>
+                <td>${holdMinutes.toFixed(1)}m</td>
+              </tr>
             `;
-        }
+          }
+        ).join('');
 
-        if (!exchangeCards) {
-            exchangeCards = '<div class="card"><p>No exchanges connected yet...</p></div>';
-        }
+        const priceHistory = Array.isArray(this.stats.priceHistory) ? this.stats.priceHistory : [];
+        
+        const activePairKeys = Object.keys(this.stats.strategyStates || {});
+        const primaryPair = activePairKeys.find((k) => {
+          const s = this.stats.strategyStates[k];
+          return Number(s?.entryPrice || 0) > 0;
+        }) || 'BNBUSDT';
 
-        let strategyHtml = '';
-        const exchanges = Object.keys(this.stats.strategyStates);
-        for (const exName of exchanges) {
-            const s = this.stats.strategyStates[exName];
-            if (!s) continue;
+        const normalizedPrimaryPair = String(primaryPair).split('/').join('').toUpperCase();
 
-            const hasPosition = s.lastBuy && s.lastBuy > 0;
-            const pct = hasPosition ? ((s.current - s.lastBuy) / s.lastBuy) * 100 : 0;
-            const color = hasPosition ? (pct >= 0 ? '#00ff88' : '#ff4444') : '#888';
+        const mainSeries = priceHistory
+          .filter((p: any) => String(p.exchange || '').split('/').join('').toUpperCase() === normalizedPrimaryPair)
+          .map((p: any) => ({
+            x: p.timestamp,
+            y: Number(p.price),
+            marker: p.marker || null
+          }))
+          .sort((a: any, b: any) => a.x - b.x);
 
-            strategyHtml += `
-            <div class="card" style="border: 1px solid ${color};">
-                <h3 style="color: ${color}; margin-bottom: 10px;">🎯 ${exName}: Active Strategy Cycle</h3>
-                <div class="stats-grid">
-                     <div class="stat-box">
-                        <div class="stat-label">Last Buy</div>
-                        <div class="stat-value">${hasPosition ? '$' + s.lastBuy.toFixed(4) : '---'}</div>
-                     </div>
-                     <div class="stat-box">
-                        <div class="stat-label">Target Sell</div>
-                        <div class="stat-value">${hasPosition ? '$' + s.target.toFixed(4) : '---'}</div>
-                     </div>
-                     <div class="stat-box">
-                        <div class="stat-label">Current Price</div>
-                        <div class="stat-value" style="color:${color}">$${(s.current || 0).toFixed(4)}</div>
-                     </div>
-                     <div class="stat-box">
-                        <div class="stat-label">Distance</div>
-                        <div class="stat-value">${hasPosition ? pct.toFixed(2) + '%' : '---'}</div>
-                     </div>
-                </div>
-                <div style="margin-top: 10px; font-size: 0.9em; text-align: center; color: #888;">
-                     Status: <span style="color: #fff; font-weight: bold;">${s.status}</span>
-                </div>
-            </div>
-            `;
-        }
+        const lineData = mainSeries.filter((p: any) => !p.marker).map((p: any) => ({ x: p.x, y: p.y }));
+        const buyMarkers = mainSeries.filter((p: any) => p.marker === 'buy').map((p: any) => ({ x: p.x, y: p.y }));
+        const sellMarkers = mainSeries.filter((p: any) => p.marker === 'sell').map((p: any) => ({ x: p.x, y: p.y }));
 
         return `
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>🤖 SLAVI Trading Bot</title>
-            <meta charset="UTF-8">
-            <meta http-equiv="refresh" content="30">
-            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-            <style>
-                * { box-sizing: border-box; margin: 0; padding: 0; }
-                body { 
-                    font-family: 'Segoe UI', Tahoma, sans-serif; 
-                    background: linear-gradient(135deg, #0d0d0d 0%, #1a1a2e 100%); 
-                    color: #fff; 
-                    min-height: 100vh;
-                    padding: 20px;
-                }
-                .header { 
-                    display: flex; 
-                    justify-content: space-between; 
-                    align-items: center; 
-                    margin-bottom: 20px;
-                    flex-wrap: wrap;
-                    gap: 10px;
-                }
-                h1 { color: #0088ff; font-size: 2em; }
-                .status-bar { 
-                    display: flex; 
-                    gap: 20px; 
-                    background: rgba(0,136,255,0.1); 
-                    padding: 10px 20px; 
-                    border-radius: 10px;
-                }
-                .status-item { text-align: center; }
-                .status-value { font-size: 1.5em; font-weight: bold; color: #0088ff; }
-                .portfolio-val { font-size: 1.8em; color: white; font-weight: bold; margin-left: 20px; }
-                
-                .card { 
-                    background: rgba(45,45,45,0.9); 
-                    border-radius: 15px; 
-                    padding: 20px; 
-                    margin-bottom: 20px; 
-                    box-shadow: 0 8px 32px rgba(0,0,0,0.3);
-                    border: 1px solid rgba(255,255,255,0.1);
-                }
-                .card-header { 
-                    display: flex; 
-                    justify-content: space-between; 
-                    align-items: center; 
-                    margin-bottom: 15px;
-                    border-bottom: 1px solid rgba(255,255,255,0.1);
-                    padding-bottom: 10px;
-                }
-                .card-footer { 
-                    margin-top: 15px; 
-                    font-size: 0.85em; 
-                    color: #888; 
-                }
-                
-                .grid { 
-                    display: grid; 
-                    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); 
-                    gap: 20px; 
-                }
-                
-                .balance-table-wrapper { max-height: 300px; overflow-y: auto; }
-                .balance-table { 
-                    width: 100%; 
-                    border-collapse: collapse; 
-                }
-                .balance-table th, .balance-table td { 
-                    padding: 8px 12px; 
-                    text-align: left; 
-                    border-bottom: 1px solid rgba(255,255,255,0.05);
-                }
-                .balance-table th { 
-                    background: rgba(0,136,255,0.1); 
-                    color: #0088ff;
-                    position: sticky;
-                    top: 0;
-                }
-                .balance-table tr:hover { background: rgba(255,255,255,0.05); }
-                
-                .log-box { 
-                    height: 300px; 
-                    overflow-y: auto; 
-                    background: #000; 
-                    padding: 15px; 
-                    border-radius: 10px;
-                    font-family: 'Courier New', monospace; 
-                    font-size: 0.85em; 
-                    color: #aaa; 
-                    line-height: 1.6;
-                    border: 1px solid #333;
-                }
-                .log-title { color: #888; margin-bottom: 5px; font-weight: bold; }
-                .log-entry-system { color: #aaa; }
-                .log-entry-strategy { color: #00ff88; }
-                .log-box div { margin-bottom: 3px; }
-                
-                .btn { 
-                    display: inline-block;
-                    padding: 10px 20px; 
-                    background: linear-gradient(135deg, #0088ff, #0055aa);
-                    color: #fff; 
-                    text-decoration: none; 
-                    border-radius: 8px;
-                    font-weight: bold;
-                    margin-right: 10px;
-                    margin-top: 10px;
-                    transition: transform 0.2s;
-                    border: none;
-                    cursor: pointer;
-                }
-                .btn:hover { transform: scale(1.05); }
-                .btn-secondary { background: linear-gradient(135deg, #444, #666); color: #fff; }
-                .btn-hodl-off { background: linear-gradient(135deg, #666, #444); color: #ccc; }
-                .btn-hodl-on { background: linear-gradient(135deg, #ff4444, #aa0000); color: #fff; animation: pulse 2s infinite; }
-                @keyframes pulse {
-                    0% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0.7); }
-                    70% { box-shadow: 0 0 0 10px rgba(255, 68, 68, 0); }
-                    100% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0); }
-                }
-                
-                .stats-grid { 
-                    display: grid; 
-                    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); 
-                    gap: 15px; 
-                    margin-top: 15px;
-                }
-                .stat-box { 
-                    background: rgba(0,0,0,0.3); 
-                    padding: 15px; 
-                    border-radius: 10px; 
-                    text-align: center;
-                }
-                .stat-label { color: #888; font-size: 0.85em; }
-                .stat-value { font-size: 1.5em; font-weight: bold; margin-top: 5px; }
-                .profit-positive { color: #00ff88; }
-                .profit-negative { color: #ff4444; }
-                .chart-container { position: relative; height: 300px; width: 100%; margin-top: 20px; }
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <div style="display:flex; align-items:center;">
-                    <h1>🚀 SLAVI BNB Production Suite</h1>
-                    <div class="portfolio-val" style="display:flex; flex-direction:column; line-height:1.2;">
-                        <span>Total: $${this.stats.totalPortfolioValue} USD</span>
-                        <span style="font-size:0.8em; color:#888;">Disponible: $${this.stats.availablePortfolioValue} USD</span>
-                    </div>
-                </div>
-                <div class="status-bar">
-                    <div class="status-item">
-                        <div class="status-value">${uptime}m</div>
-                        <div>Uptime</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value" style="color: #0f0;">● ONLINE</div>
-                        <div>Status</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value" style="color: ${telegram.isEnabled() ? '#0f0' : '#888'};">
-                            ${telegram.isEnabled() ? '🔔 ACTIVE' : '🔕 OFF'}
-                        </div>
-                        <div>Telegram</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">${this.stats.tradeStats.tradeCount}</div>
-                        <div>Trades</div>
-                    </div>
-                </div>
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>SLAVI TERMINAL v2.2</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;700;900&display=swap" rel="stylesheet">
+    <style>
+        :root { --bg: #020617; --card: rgba(15, 23, 42, 0.6); --accent: #00d2ff; --green: #10b981; --red: #f43f5e; --yellow: #f59e0b; --text: #f8fafc; --muted: #94a3b8; --border: rgba(255,255,255,0.08); }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Outfit', sans-serif; }
+        body { background: var(--bg); color: var(--text); padding: 2rem; min-height: 100vh; background-image: radial-gradient(circle at top right, #1e293b, #020617); }
+        
+        .header { display: flex; justify-content: space-between; align-items: start; margin-bottom: 2.5rem; }
+        .brand h1 { font-size: 2.2rem; font-weight: 900; letter-spacing: -1px; background: linear-gradient(to right, #fff, var(--accent)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .portfolio-main { font-size: 3rem; font-weight: 900; margin-top: 0.5rem; }
+        
+        .stats-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
+        .pill { background: var(--card); border: 1px solid var(--border); border-radius: 1.2rem; padding: 1.2rem; backdrop-filter: blur(10px); text-align: center; }
+        .pill-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 2px; color: var(--muted); margin-bottom: 0.5rem; }
+        .pill-value { font-size: 1.6rem; font-weight: 700; }
+
+        .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1.5rem; margin-bottom: 1.5rem; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 1.5rem; padding: 1.8rem; backdrop-filter: blur(15px); box-shadow: 0 20px 50px -12px rgba(0,0,0,0.5); }
+        .card-title { font-size: 1.1rem; font-weight: 700; margin-bottom: 1.5rem; display: flex; justify-content: space-between; align-items: center; }
+        
+        .chart-box { height: 350px; width: 100%; margin-top: 1rem; }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+        th { text-align: left; padding: 1rem; color: var(--muted); font-size: 0.8rem; text-transform: uppercase; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: rgba(15, 23, 42, 0.9); }
+        td { padding: 1rem; border-bottom: 1px solid var(--border); font-size: 0.95rem; }
+        .row-buy { color: var(--green); font-weight: 700; }
+        .row-sell { color: var(--red); font-weight: 700; }
+        
+        .terminal { height: 300px; overflow-y: auto; background: rgba(0,0,0,0.4); border-radius: 1rem; padding: 1rem; font-family: monospace; font-size: 0.85rem; color: #cbd5e1; line-height: 1.6; border: 1px solid var(--border); }
+        .btn { padding: 0.8rem 1.5rem; border-radius: 0.8rem; border: none; font-weight: 700; cursor: pointer; transition: 0.3s; }
+        .btn-hodl { background: ${hodl ? 'var(--red)' : 'rgba(255,255,255,.1)'}; color: #fff; }
+        
+        .status-dot { height: 8px; width: 8px; background: var(--green); border-radius: 50%; display: inline-block; margin-right: 8px; box-shadow: 0 0 10px var(--green); }
+        .grid-wide { grid-template-columns: 2fr 1fr; }
+        .grid-full { grid-column: span 2; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="brand">
+            <h1>SLAVI TERMINAL v2.2</h1>
+            <div class="portfolio-main">$${this.stats.totalPortfolioValue} <span style="font-size: 1rem; color: var(--muted);">USD</span></div>
+            <div style="color: var(--muted); margin-top: 0.5rem; font-weight: 600;">${this.stats.totalPortfolioBNB} BNB · ${this.stats.totalPortfolioMXN} MXN</div>
+        </div>
+        <div style="display: flex; gap: 1rem; align-items: start;">
+            <button class="btn btn-hodl" onclick="fetch('/api/toggle-hodl').then(()=>location.reload())">
+                ${hodl ? '🛑 HODL MODE ACTIVE' : '🔓 TRADING ACTIVE'}
+            </button>
+            <a class="btn" style="background:rgba(255,255,255,.06);color:var(--text);text-decoration:none" href="/api/logs" target="_blank">📄 Logs</a>
+        </div>
+    </div>
+
+    <div class="stats-bar">
+        <div class="pill"><div class="pill-label">Uptime</div><div class="pill-value">${uptime}m</div></div>
+        <div class="pill"><div class="pill-label">Market Status</div><div class="pill-value" style="color: var(--green)"><span class="status-dot"></span>LIVE</div></div>
+        <div class="pill"><div class="pill-label">Trades (Total)</div><div class="pill-value">${this.stats.tradeStats.tradeCount}</div></div>
+        <div class="pill"><div class="pill-label">Net ROI</div><div class="pill-value" style="color: ${parseFloat(this.stats.tradeStats.netProfit) >= 0 ? 'var(--green)' : 'var(--red)'}">${this.stats.tradeStats.profitPercent}%</div></div>
+    </div>
+
+    <div class="grid grid-full">
+        <div class="card">
+            <div class="card-title">⚡ ACTIVE PAIRS & DELTA <span style="color:var(--muted);font-size:.8rem">${Object.keys(this.stats.strategyStates).length} slots</span></div>
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Pair</th>
+                            <th>State</th>
+                            <th>Entry</th>
+                            <th>Current</th>
+                            <th>Net Target</th>
+                            <th>Net P/L</th>
+                            <th>Delta to Target</th>
+                            <th>Peak P/L</th>
+                            <th>Hold</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${activePairsRows || '<tr><td colspan="9" style="text-align: center; color: var(--muted);">🔍 Escáner buscando oportunidades...</td></tr>'}
+                    </tbody>
+                </table>
             </div>
-            
-            ${strategyHtml}
-            
-            <!-- Trade Stats -->
-            <div class="card">
-                <h3>📊 Trading Statistics</h3>
-                <div class="stats-grid">
-                    <div class="stat-box">
-                        <div class="stat-label">Total Buys</div>
-                        <div class="stat-value">$${this.stats.tradeStats.totalBuys}</div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-label">Total Sells</div>
-                        <div class="stat-value">$${this.stats.tradeStats.totalSells}</div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-label">Net P/L</div>
-                        <div class="stat-value ${parseFloat(this.stats.tradeStats.netProfit) >= 0 ? 'profit-positive' : 'profit-negative'}">
-                            $${this.stats.tradeStats.netProfit}
-                        </div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-label">ROI</div>
-                        <div class="stat-value ${parseFloat(this.stats.tradeStats.profitPercent) >= 0 ? 'profit-positive' : 'profit-negative'}">
-                            ${this.stats.tradeStats.profitPercent}%
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="chart-container">
-                    <canvas id="profitChart"></canvas>
-                </div>
+        </div>
+    </div>
 
-                ${this.stats.aiSentiment ? `
-                <div style="margin-top: 20px; padding: 15px; background: rgba(0,0,255,0.1); border-left: 4px solid #0088ff; border-radius: 5px;">
-                    <h4 style="color: #0088ff; margin-bottom: 5px;">🧠 AI Insight (${this.stats.aiSentiment.model})</h4>
-                    <div style="font-size: 1.2em; font-weight: bold; margin-bottom: 5px;">
-                        ${this.stats.aiSentiment.sentiment} 
-                        <span style="font-size: 0.8em; color: #888;">(Score: ${this.stats.aiSentiment.score})</span>
-                    </div>
-                    <div style="font-style: italic; color: #ccc;">"${this.stats.aiSentiment.reasoning}"</div>
-                    
-                    ${this.stats.aiSentiment.news && this.stats.aiSentiment.news.length > 0 ? `
-                    <details style="margin-top: 10px; color: #aaa; font-size: 0.9em;">
-                        <summary style="cursor: pointer; outline: none;">See ${this.stats.aiSentiment.news.length} Analyzed Headlines</summary>
-                        <ul style="margin-top: 5px; padding-left: 20px; list-style-type: none;">
-                            ${this.stats.aiSentiment.news.map((n: any) => `
-                                <li style="margin-bottom: 5px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 3px;">
-                                    ${n.title} 
-                                    <span style="font-size:0.8em; color:#0088ff">(${n.source})</span>
-                                </li>`).join('')}
-                        </ul>
-                    </details>
-                    ` : ''}
-
-                    <div style="font-size: 0.7em; color: #666; margin-top: 5px;">Updated: ${new Date(this.stats.aiSentiment.timestamp).toLocaleTimeString()}</div>
-                </div>` : ''}
-
-                <div style="margin-top: 15px; display: flex; align-items: center; flex-wrap: wrap;">
-                    <button id="hodlToggleBtn" class="btn ${this.stats.hodlMode ? 'btn-hodl-on' : 'btn-hodl-off'}" onclick="toggleHodl()">
-                        ${this.stats.hodlMode ? '🛡️ HODL MODE ACTIVE (No-Sell)' : '🔓 Enable HODL Mode'}
-                    </button>
-                    <a href="/api/export-csv" class="btn">📥 Download CSV</a>
-                    <a href="/api/logs" class="btn btn-secondary">📄 Download Logs</a>
-                </div>
+    <div class="grid grid-wide">
+        <div class="card">
+            <div class="card-title">📈 PRICE PERFORMANCE (${primaryPair})</div>
+            <div class="chart-box"><canvas id="mainChart"></canvas></div>
+        </div>
+        <div class="card">
+            <div class="card-title">💰 ASSET BALANCES</div>
+            <div style="max-height: 350px; overflow-y: auto;">
+                <table>
+                    <thead><tr><th>Asset</th><th>Total</th><th>Value USD</th></tr></thead>
+                    <tbody>
+                        ${Object.values(this.stats.exchanges).flatMap((ex: any) =>
+                            ex.balances.filter((b: any) => b.total > 0).map((b: any) => `
+                                <tr>
+                                    <td><strong style="color: var(--accent)">${b.asset}</strong></td>
+                                    <td>${b.total.toFixed(b.asset === 'MXN' ? 2 : 6)}</td>
+                                    <td style="color: var(--muted)">$${(b.usdValue || 0).toFixed(2)}</td>
+                                </tr>
+                            `)
+                        ).join('')}
+                    </tbody>
+                </table>
             </div>
+        </div>
+    </div>
 
-            ${this.getRecentTradesHtml()}
-            
-            <!-- Exchange Balances -->
-            <h2 style="color: #0088ff; margin: 20px 0 15px;">💰 Portfolio (Real-Time)</h2>
-            <div class="grid">
-                ${exchangeCards}
+    <div class="grid">
+        <div class="card grid-full">
+            <div class="card-title">📜 RECENT TRANSACTIONS (TRADES.DB)</div>
+            <div style="max-height: 300px; overflow-y: auto;">
+            <table>
+                <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>Amount</th><th>Total USD</th></tr></thead>
+                <tbody>
+                    ${trades.slice().reverse().slice(0, 20).map((t: any) => `
+                        <tr>
+                            <td style="color: var(--muted)">${new Date(t.timestamp).toLocaleTimeString()}</td>
+                            <td><strong>${t.symbol}</strong></td>
+                            <td class="${t.side === 'BUY' ? 'row-buy' : 'row-sell'}">${t.side}</td>
+                            <td>$${t.price}</td>
+                            <td>${t.amount}</td>
+                            <td><strong>$${t.total.toFixed(2)}</strong></td>
+                        </tr>
+                    `).join('')}
+                    ${trades.length === 0 ? '<tr><td colspan="6" style="text-align: center; color: var(--muted);">No recent trades</td></tr>' : ''}
+                </tbody>
+            </table>
             </div>
+        </div>
+    </div>
 
-            <!-- Dual Terminals -->
-            <div class="grid">
-                <div class="card">
-                    <div class="log-title">🖥️ System Terminal</div>
-                    <div class="log-box">
-                        ${this.stats.logs.map((l: string) => `<div class="log-entry-system">${l}</div>`).join('')}
-                    </div>
-                </div>
-                <div class="card">
-                    <div class="log-title">🧠 Strategy Engine</div>
-                    <div class="log-box">
-                        ${this.stats.strategyLogs.map((l: string) => `<div class="log-entry-strategy">> ${l}</div>`).join('')}
-                    </div>
-                </div>
-            </div>
-            
-            <script>
-                function toggleHodl() {
-                    fetch('/api/toggle-hodl', { method: 'POST' })
-                        .then(res => res.json())
-                        .then(data => {
-                            window.location.reload(); // Refresh to update visuals
-                        });
-                }
+    <div class="grid">
+        <div class="card">
+            <div class="card-title">🖥️ SYSTEM LOGS</div>
+            <div class="terminal">${this.stats.logs.map((l: string) => `<div>${l}</div>`).join('')}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">🧠 STRATEGY ENGINE</div>
+            <div class="terminal">${this.stats.strategyLogs.map((l: string) => `<div>${l}</div>`).join('')}</div>
+        </div>
+    </div>
 
-                // Price History Data (from server) - includes all Bitso pairs
-                // Price History Data (from server)
-                // Filter: Show all or specific exchange. Currently we use 'Binance'.
-                const priceData = ${JSON.stringify(this.stats.priceHistory.map((p: any) => ({ x: p.timestamp, y: p.price, marker: p.marker, ex: p.exchange })))};
-                
-                // Separate regular points from trade markers
-                const lineData = priceData.map((p: any) => ({ x: p.x, y: p.y }));
-                const buyMarkers = priceData.filter((p: any) => p.marker === 'buy').map((p: any) => ({ x: p.x, y: p.y }));
-                const sellMarkers = priceData.filter((p: any) => p.marker === 'sell').map((p: any) => ({ x: p.x, y: p.y }));
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        socket.on('state', (state) => {
+            if (performance.now() > 300000) { location.reload(); return; }
+        });
+        setTimeout(() => { location.reload(); }, 30000);
 
-                const ctx = document.getElementById('profitChart').getContext('2d');
-                const pChart = new Chart(ctx, {
-                    type: 'line',
-                    data: {
-                        datasets: [
-                            {
-                                label: 'Price (USD)',
-                                data: lineData,
-                                borderColor: '#00ff88',
-                                backgroundColor: 'rgba(0, 255, 136, 0.1)',
-                                fill: true,
-                                tension: 0.2,
-                                pointRadius: 2
-                            },
-                            {
-                                label: 'Buy',
-                                data: buyMarkers,
-                                type: 'scatter',
-                                backgroundColor: '#00ff88',
-                                pointRadius: 8,
-                                pointStyle: 'triangle'
-                            },
-                            {
-                                label: 'Sell',
-                                data: sellMarkers,
-                                type: 'scatter',
-                                backgroundColor: '#ff4444',
-                                pointRadius: 8,
-                                pointStyle: 'rectRot'
-                            }
-                        ]
+        const ctx = document.getElementById('mainChart').getContext('2d');
+        new Chart(ctx, {
+            type: 'line',
+            data: {
+                datasets: [
+                    {
+                        label: '${primaryPair} Price (USD)',
+                        data: ${JSON.stringify(lineData)},
+                        borderColor: '#00d2ff',
+                        backgroundColor: 'rgba(0, 210, 255, 0.1)',
+                        fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2
                     },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        interaction: { intersect: false, mode: 'index' },
-                        plugins: { 
-                            legend: { display: true, labels: { color: '#fff' } },
-                            tooltip: { 
-                                callbacks: { label: (c) => '$' + (c.raw as any).y.toFixed(4) }
-                            }
-                        },
-                        scales: {
-                            y: { 
-                                grid: { color: 'rgba(255,255,255,0.05)' }, 
-                                ticks: { color: '#888' },
-                                title: { display: true, text: 'Price ($)', color: '#888' }
-                            },
-                            x: { 
-                                type: 'linear',
-                                grid: { display: false }, 
-                                ticks: { 
-                                    color: '#888',
-                                    callback: function(value: any) {
-                                        return new Date(value).toLocaleTimeString();
-                                    }
-                                },
-                                title: { display: true, text: 'Time', color: '#888' }
-                            }
-                        }
+                    {
+                        label: 'Buy', data: ${JSON.stringify(buyMarkers)},
+                        type: 'scatter', backgroundColor: '#10b981', pointRadius: 6, pointStyle: 'triangle'
+                    },
+                    {
+                        label: 'Sell', data: ${JSON.stringify(sellMarkers)},
+                        type: 'scatter', backgroundColor: '#f43f5e', pointRadius: 6, pointStyle: 'rectRot'
                     }
-                });
-
-                // Auto-update chart every 10s
-                /*
-                setInterval(() => {
-                    fetch('/api/chart-data')
-                        .then(r => r.json())
-                        .then(d => {
-                            pChart.data.labels = d.labels;
-                            pChart.data.datasets[0].data = d.data;
-                            pChart.update();
-                        });
-                }, 10000);
-                */
-            </script>
-            
-            <footer style="text-align: center; color: #444; margin-top: 30px; font-size: 0.8em;">
-                SLAVI BNB Production Suite v2.0 | High-Performance Scalper
-            </footer>
-        </body>
-        </html>
-        `;
+                ]
+            },
+            options: {
+                responsive: true, maintainAspectRatio: false,
+                interaction: { intersect: false, mode: 'index' },
+                scales: {
+                    x: { type: 'linear', grid: { display: false }, ticks: { color: '#94a3b8', callback: v => new Date(v).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) } },
+                    y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#94a3b8' } }
+                },
+                plugins: { legend: { display: false } }
+            }
+        });
+    </script>
+</body>
+</html>`;
     }
 }

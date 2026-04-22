@@ -5,9 +5,13 @@
   "main": "dist/index.js",
   "scripts": {
     "start": "node dist/index.js",
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "dev": "ts-node-dev --respawn --exit-child --transpile-only src/index.ts",
     "build": "tsc",
     "migrate": "ts-node src/migrate_csv_to_db.ts",
+    "migrate:001": "sqlite3 trades.db < scripts/migrations/001_add_exit_reason.sql",
+    "migrate:002": "sqlite3 trades.db < scripts/migrations/002_rate_limit_log.sql",
+    "analyze": "ts-node scripts/analyze-trades.ts",
+    "journal:stats": "ts-node scripts/analyze-trades.ts",
     "test": "jest"
   },
   "keywords": [],
@@ -20,6 +24,8 @@
     "@types/socket.io": "^3.0.1",
     "@types/ws": "^8.18.1",
     "axios": "^1.13.2",
+    "better-sqlite3": "^12.9.0",
+    "binance": "^3.5.5",
     "crypto-js": "^4.2.0",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
@@ -30,6 +36,7 @@
     "ws": "^8.20.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/crypto-js": "^4.2.2",
     "@types/node": "^24.10.9",
     "ts-node": "^10.9.2",

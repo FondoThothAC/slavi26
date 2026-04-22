@@ -7,7 +7,12 @@ const clients: Set<WebSocket> = new Set();
 /**
  * Inicializa el servidor de WebSockets en el puerto especificado.
  */
-export function startWebSocketServer(port: number = 8080) {
+export function startWebSocketServer(port: number = 8080): WebSocketServer {
+    if (wss) {
+        console.log(`[WS] Reusing existing WebSocket server on ${port}`);
+        return wss;
+    }
+
     wss = new WebSocketServer({ port });
 
     console.log(`[Dashboard] 📡 Servidor WebSocket (Antigravity Engine) escuchando en puerto ${port}`);
@@ -23,6 +28,39 @@ export function startWebSocketServer(port: number = 8080) {
 
         ws.on('error', (error) => {
             console.error('[Dashboard] ⚠️ Error en WebSocket:', error);
+        });
+    });
+
+    wss.on('error', (err: any) => {
+        if (err?.code === 'EADDRINUSE') {
+            console.error(`[WS] Port ${port} already in use. Retrying or cleanup needed.`);
+            return;
+        }
+        console.error('[WS] Server error:', err);
+    });
+
+    return wss;
+}
+
+/**
+ * Detiene el servidor de WebSockets limpiamente.
+ */
+export async function stopWebSocketServer(): Promise<void> {
+    if (!wss) return;
+
+    console.log('[WS] Closing WebSocket server...');
+    
+    // Close all active connections first
+    clients.forEach(client => {
+        client.terminate();
+    });
+    clients.clear();
+
+    return new Promise((resolve) => {
+        wss!.close(() => {
+            console.log('[WS] WebSocket server closed.');
+            wss = null;
+            resolve();
         });
     });
 }

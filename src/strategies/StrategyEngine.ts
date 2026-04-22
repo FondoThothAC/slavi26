@@ -1,7 +1,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { SCALING_CONFIG } from '../config';
+import { SCALING_CONFIG } from '../config/ScalingConfig';
+import { EXIT_CONFIG } from '../config/ExitConfig';
+import { RISK_CONFIG } from '../config/RiskConfig';
+import { RATE_LIMIT_CONFIG } from '../config/RateLimitConfig';
 import { Exchange, Order, OrderRequest, Portfolio } from '../exchanges/Exchange';
+import { RiskGuard } from '../risk/RiskGuard';
+import { TrailingTakeProfit, TTPState } from '../exit/TrailingTakeProfit';
+import { TradeJournal } from '../telemetry/TradeJournal';
+import { TradeState, EntryReason, ExitReason, PositionSnapshot, VolumeStarter } from '../types';
+import { WebSocketService } from '../services/WebSocketService';
+import { RateLimiter } from '../utils/RateLimiter';
+import { BinanceWebSocketManager } from '../utils/BinanceWebSocketManager';
 
 
 declare var console: any;
@@ -678,54 +688,69 @@ export class CompoundBoosterStrategy implements Strategy {
 }
 
 /**
- * Active Scalper Strategy.
- * - Buys trending coins.
- * - Sells at +1.5% profit.
- * - Timeout: If > 45 mins, sells at market (Unstuck).
- * - Stop Loss: -2%.
+ * @module StrategyEngine
+ * @description Orquestador de la estrategia "Round-Robin Sequential Scalping".
+ * Matriz DCA de slots independientes con Trailing Take-Profit y Timeouts.
+ * 
+ * @architecture
+ *   Prices: WebSocket Streams (0 rate limit)
+ *   Orders: REST API (1200 req/min with batching)
+ *   Balance: REST + Cache (60s TTL)
+ * 
+ * @version 2.2.0
  */
 export class ActiveScalperStrategy implements Strategy {
-    name = 'Active Scalper (High Turnover)';
-    description = 'Scalps trending coins with Timeout and Stop Loss protection.';
-    type: 'dca' = 'dca'; // Fits DCA/Active profile
+    name = 'SLAVI v2.2.0 (2026-04-22) - Multi-Slot RR';
+    description = 'No price-based hard stop-loss; timeout frees frozen capital. Parallel slots on BNB pairs.';
+    type: 'dca' = 'dca';
     isActive = true;
-    private hodlModeActive: boolean = false;
-    private stateFile: string;
-    private highWaterMark: number = 0;
-    private highWaterMarkGain: number = 0; // Tracks peak PNL %
 
-    private lastBuyTime: number = 0;
-    private lastBuyPrice: number = 0;
+    private stateFile: string;
+    private journal: TradeJournal;
+    private ttp: TrailingTakeProfit;
+    private wsService: WebSocketService;
+    private rateLimiter: RateLimiter;
+    
+    // Multi-slot state
+    private activePositions: Map<string, PositionSnapshot & { ttpState: TTPState }> = new Map();
+    private pairRotationIndex: number = 0;
+
     constructor(
-        private quoteAmount: number = 0.0105, // Amount in quote asset (e.g. 0.0105 BNB or 10 USDT)
-        private exchangeSymbol: string, // e.g. Binance_SOL/BNB
-        private profitTargetPercent: number = 0.003, // 0.3%
-        private stopLossPercent: number = 0, // Disabled
-        private timeoutMinutes: number = 480, // 8hrs
-        private feePercent: number = 0.00075 // BNB fee 0.075%
+        private quoteAmount: number = SCALING_CONFIG.ORDER_SIZE_BNB,
+        private exchangeSymbol: string,
     ) {
         const safeSymbol = exchangeSymbol.replace(/[^a-zA-Z0-9]/g, '_');
-        this.stateFile = path.join(process.cwd(), `scalper_state_${safeSymbol}.json`);
+        this.stateFile = path.join(process.cwd(), `scalper_state_multi_${safeSymbol}.json`);
+        
+        this.ttp = new TrailingTakeProfit(EXIT_CONFIG);
+        this.journal = new TradeJournal();
+        this.wsService = BinanceWebSocketManager.getInstance();
+        this.rateLimiter = RateLimiter.getInstance();
+        
         this.loadState();
+        
+        console.log(`[Strategy] Initialized ${this.name} for ${exchangeSymbol}`);
+        console.log(`[Strategy] Architecture: WebSocket (Prices) + REST (Orders)`);
     }
 
     private loadState() {
         try {
             if (fs.existsSync(this.stateFile)) {
                 const data = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
-                this.lastBuyPrice = data.lastBuyPrice || 0;
-                this.lastBuyTime = data.lastBuyTime || 0;
-                this.highWaterMarkGain = data.highWaterMarkGain || 0;
+                if (data.activePositions) {
+                    this.activePositions = new Map(Object.entries(data.activePositions));
+                }
+                this.pairRotationIndex = data.pairRotationIndex || 0;
             }
         } catch (e) { }
     }
 
     private saveState() {
         try {
+            const activeObj = Object.fromEntries(this.activePositions);
             fs.writeFileSync(this.stateFile, JSON.stringify({
-                lastBuyPrice: this.lastBuyPrice,
-                lastBuyTime: this.lastBuyTime,
-                highWaterMarkGain: this.highWaterMarkGain,
+                activePositions: activeObj,
+                pairRotationIndex: this.pairRotationIndex,
                 updatedAt: new Date().toISOString()
             }, null, 2));
         } catch (e) { }
@@ -733,235 +758,139 @@ export class ActiveScalperStrategy implements Strategy {
 
     public getState() {
         return {
-            lastBuyPrice: this.lastBuyPrice,
-            lastBuyTime: this.lastBuyTime,
-            target: this.lastBuyPrice * (1 + this.profitTargetPercent)
+            activeCount: this.activePositions.size,
+            pairRotationIndex: this.pairRotationIndex,
+            positions: Array.from(this.activePositions.values())
         };
     }
 
     public setHodlMode(active: boolean) {
-        this.hodlModeActive = active;
-    }
-
-    /**
-     * Calculates the Target Price and Break-Even to ensure REAL profits after fees.
-     * Based on user formula: (costo_compra_con_fee * (1 + profit_rate)) / (1 - fee_rate)
-     */
-    private calculateTargetPrice(purchasePrice: number, netProfitPct: number): { target: number, breakEven: number } {
-        const feeRate = this.feePercent;
-        const profitRate = netProfitPct;
-
-        // Costo total real de la compra (Precio + Comisión de compra)
-        const costoCompraConFee = purchasePrice * (1 + feeRate);
-
-        // Break-Even (Price where net profit is 0%)
-        const breakEven = costoCompraConFee / (1 - feeRate);
-
-        // Target Price for desired net profit
-        const target = (costoCompraConFee * (1 + profitRate)) / (1 - feeRate);
-
-        return { target, breakEven };
+        // En v2.2 el timeout es mandatorio para rotación de capital.
+        // Este método se mantiene por compatibilidad con el Dashboard.
     }
 
     async analyze(exchange: Exchange, symbol: string): Promise<Signal[]> {
-        const quote = symbol.split('/')[1]; // USDT
-        const base = symbol.split('/')[0];  // SOL
-
-        // Parallelize data fetching
-        const tStart = Date.now();
-        const [ticker, balances, openOrders] = await Promise.all([
-            exchange.getTicker(symbol),
-            exchange.getBalance(),
-            exchange.getOpenOrders(symbol)
-        ]);
-        const tEnd = Date.now();
-
-        if ((tEnd - tStart) > 2000) {
-            console.log(`[Perf] ${symbol} Analysis Data Fetch took ${tEnd - tStart}ms`);
-        }
-
-        const quoteBal = balances.find((b: any) => b.asset === quote)?.free || 0;
-        const baseBal = balances.find((b: any) => b.asset === base)?.free || 0;
-        // const openOrders = await exchange.getOpenOrders(symbol); // Already fetched
-
-        const signals: Signal[] = [];
         const now = Date.now();
+        const signals: Signal[] = [];
 
-        // 1. Check Inventory & Stale Orders (TIMEOUT LOGIC)
-        const baseValueQuote = baseBal * ticker.bid;
-        const minInventoryValue = quote === 'BNB' ? 0.002 : 1; // Lowered to 0.002 BNB (~$1.2) to avoid forgetting positions on small drops
-        const hasInventory = baseValueQuote > minInventoryValue; 
+        // 1. Suscribirse a este par en el WebSocket si no lo está
+        this.wsService.subscribe([symbol.replace('/', '')]);
 
-        if (hasInventory) {
-            const currencyMark = quote === 'BNB' ? '' : '$';
-            const currencySuffix = quote === 'BNB' ? ' BNB' : '';
+        // 2. ¿Tenemos ya una posición abierta para este símbolo?
+        const existingPosition = Array.from(this.activePositions.values()).find(p => p.pair === symbol);
 
-            // FIX: Orphaned Inventory (Restarted Bot or External Buy)
-            // If we have inventory but lastBuyTime is 0, we treat it as "Just Bought" to start the timeout clock.
-            // MOVED: Must happen before target/break-even calculation to avoid Infinity%
-            if (this.lastBuyTime === 0) {
-                this.lastBuyTime = now;
-                // Ideally we'd know the price, but we don't. Assume current price is entry.
-                if (this.lastBuyPrice === 0) this.lastBuyPrice = ticker.last;
-                console.log(`[Strategy] Adopted orphaned inventory for ${symbol}. Starting timer...`);
-            }
+        if (existingPosition) {
+            // --- GESTIÓN DE POSICIÓN ACTIVA ---
+            const currentPrice = this.wsService.getPrice(symbol);
+            if (!currentPrice) return []; // Esperar a que el WS nos dé precio
 
-            // OPTIONAL: Break-Even / Target Analysis
-            const { target, breakEven } = this.calculateTargetPrice(this.lastBuyPrice, this.profitTargetPercent);
+            const grossPnlPct = (currentPrice - existingPosition.entryPrice) / existingPosition.entryPrice;
+            const ROUND_TRIP_FEE_PCT = 0.0015; // 0.15% (0.075% buy + 0.075% sell with BNB)
+            const netPnlPct = grossPnlPct - ROUND_TRIP_FEE_PCT;
 
-            /* STOP LOSS REMOVED - "Quitar la venta de panico"
-            if (!this.hodlModeActive && this.lastBuyPrice > 0 && ticker.bid < this.lastBuyPrice * (1 - this.stopLossPercent)) {
-                ...
-            }
-            */
+            // Actualizar snapshot para evaluación
+            existingPosition.currentPrice = currentPrice;
+            existingPosition.currentProfitPct = netPnlPct;
+            
+            const openedAt = existingPosition.openedAt instanceof Date 
+                ? existingPosition.openedAt 
+                : new Date(existingPosition.openedAt);
+            existingPosition.holdDurationMinutes = (now - openedAt.getTime()) / 60000;
 
-            // Inventory is handled above
+            // Update TTP
+            existingPosition.ttpState = this.ttp.update(existingPosition.ttpState, netPnlPct);
+            existingPosition.peakProfitPct = existingPosition.ttpState.peakProfitPct;
+            existingPosition.targetActivated = existingPosition.ttpState.targetActivated;
+            existingPosition.trailingArmed = existingPosition.ttpState.isActive;
 
-            // Check if we hit Timeout (45 mins)
-            // If we have open sell orders, check their age
-            // If we have inventory but NO orders, check lastBuyTime
-            let timeHeld = 0;
-            if (this.lastBuyTime > 0) {
-                timeHeld = now - this.lastBuyTime;
-            }
+            this.saveState();
 
-            const isTimeout = timeHeld > (this.timeoutMinutes * 60 * 1000);
-            const targetPrice = target; // Reuse target calculated above
-
-            // Bypass Timeout sells if it would result in a LOSS or if HODL Mode is ON
-            const isAtLoss = ticker.bid < breakEven;
-
-            if (isTimeout && !this.hodlModeActive && !isAtLoss) {
-                // Cancel any open sells first? 
-                if (openOrders.length > 0) {
-                    for (const o of openOrders) {
-                        signals.push({
-                            symbol,
-                            action: 'cancel_replace',
-                            strength: 100,
-                            reason: `TIMEOUT (${Math.floor(timeHeld / 60000)}m): Cancelling order ${o.id} to Sell at Market`,
-                            price: ticker.bid,
-                            suggestedAmount: baseBal,
-                            timestamp: new Date()
-                        });
-                    }
-                } else {
-                    // No open orders, just inventory held too long
-                    signals.push({
-                        symbol,
-                        action: 'sell',
-                        strength: 100,
-                        reason: `TIMEOUT (${Math.floor(timeHeld / 60000)}m): Unstucking capital. Selling at Market.`,
-                        price: ticker.bid,
-                        suggestedAmount: baseBal,
-                        timestamp: new Date()
-                    });
-                }
+            // A. RiskGuard: Timeout Check
+            const riskDecision = RiskGuard.evaluateOpenPosition(existingPosition, RISK_CONFIG);
+            if (riskDecision.action === 'TIMEOUT') {
+                signals.push({
+                    symbol,
+                    action: 'sell',
+                    strength: 100,
+                    reason: `⚠️ [MAX_HOLD_TIMEOUT] ${riskDecision.reason}`,
+                    price: currentPrice,
+                    timestamp: new Date()
+                });
                 return signals;
             }
 
-            // === INTEGRATED TRAILING STOP ===
-            const pnlPct = this.lastBuyPrice > 0 ? ((ticker.bid - breakEven) / breakEven * 100) : 0;
-
-            if (ticker.bid >= targetPrice) {
-                // Tracking is handled by highWaterMarkGain
-                const currentGain = pnlPct;
-                const ridingTrigger = (this.profitTargetPercent * 100) * 1.20; // 20% excess over target
-                
-                // Start or update highWaterMark when above trigger
-                if (currentGain > ridingTrigger) {
-                    this.highWaterMarkGain = Math.max(this.highWaterMarkGain, currentGain);
-                    this.saveState();
-                }
-
-                // SELL Condition: Fixed 0.10 pp pullback from peak gain
-                // e.g. peak = +0.60% → sell if gain falls below 0.60 - 0.10 = 0.50%
-                const sellTriggerGain = this.highWaterMarkGain - SCALING_CONFIG.trailingCallbackPct;
-                if (this.highWaterMarkGain > ridingTrigger && currentGain < sellTriggerGain) {
-                    signals.push({
-                        symbol,
-                        action: 'sell',
-                        strength: 100,
-                        reason: `🎯 RIDING EXIT: Peak +${this.highWaterMarkGain.toFixed(3)}% | Now +${currentGain.toFixed(3)}% | Trigger ${sellTriggerGain.toFixed(3)}% (−${SCALING_CONFIG.trailingCallbackPct}pp callback)`,
-                        price: ticker.bid,
-                        suggestedAmount: baseBal,
-                        timestamp: new Date()
-                    });
-                } else {
-                    signals.push({
-                        symbol,
-                        action: 'hold',
-                        strength: 5,
-                        reason: `🚀 RIDING${currentGain > ridingTrigger ? ' (Hyper)' : ''}! P/L: +${pnlPct.toFixed(2)}% | Peak: ${this.highWaterMarkGain.toFixed(3)}% | Sell < ${sellTriggerGain.toFixed(3)}%`,
-                        price: ticker.bid,
-                        timestamp: new Date()
-                    });
-                }
+            // B. TTP Check
+            if (this.ttp.shouldExit(existingPosition.ttpState, netPnlPct)) {
+                signals.push({
+                    symbol,
+                    action: 'sell',
+                    strength: 100,
+                    reason: `🎯 [TRAILING_EXIT] ${this.ttp.describe(existingPosition.ttpState)}`,
+                    price: currentPrice,
+                    timestamp: new Date()
+                });
             } else {
-                // Not yet at minimum profit
+                // Telemetry heartbeat
+                const targetNetPct = EXIT_CONFIG.INITIAL_TARGET_PCT - ROUND_TRIP_FEE_PCT;
+                if (!existingPosition.targetActivated) {
+                    if (Math.random() < 0.1) {
+                        console.log(`  🔎 [${symbol}] Holding | Net Target: +${(targetNetPct * 100).toFixed(2)}% | Current: ${(netPnlPct * 100).toFixed(2)}% (Profit after 0.15% Fees)`);
+                    }
+                } else {
+                    if (Math.random() < 0.1) {
+                        console.log(`  🚀 [${symbol}] Riding (Net P/L: ${(netPnlPct * 100).toFixed(2)}% | Peak: ${(existingPosition.peakProfitPct * 100).toFixed(2)}%)`);
+                    }
+                }
+
                 signals.push({
                     symbol,
                     action: 'hold',
-                    strength: 5,
-                    reason: `Holding. P/L: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}% | Need: +${(this.profitTargetPercent * 100).toFixed(1)}% (${currencyMark}${targetPrice.toFixed(quote === 'BNB' ? 6 : 2)}${currencySuffix})`,
-                    price: ticker.bid,
+                    strength: 10,
+                    reason: this.ttp.describe(existingPosition.ttpState),
+                    price: currentPrice,
                     timestamp: new Date()
                 });
             }
 
         } else {
-            // No Inventory -> Look to BUY
-            // Only buy if we have allocated funds
-            // (Assuming bot loop checks global allocation, but here we enforce baseAmount)
-            // Fix: If we took a tiny loss (e.g. timeout dropped us from $10.00 to $9.98), we should trade with $9.98.
-            // Minimum Binance order is $5. We set our absolute floor to $5.50 to be safe.
-            // Minimum Binance order: ~10 USDT or 0.01 BNB (Lowered to 0.001 for flexibility)
-            const MIN_NOTIONAL = quote === 'BNB' ? 0.001 : 1.0; // Slightly above min for safety
-            const availableToSpend = Math.min(quoteBal, this.quoteAmount);
+            // --- EVALUAR NUEVA ENTRADA (ROUND-ROBIN) ---
+            
+            // ¿Hay slots libres?
+            if (this.activePositions.size >= SCALING_CONFIG.MAX_CONCURRENT_PAIRS) {
+                return [];
+            }
 
-            if (availableToSpend >= MIN_NOTIONAL) {
-                // Simple entry: If we are here, the scanner already said it's a good coin.
-                // Just buy at market (or generous limit) to get in.
-                // Only if no open buy orders
-                const buys = openOrders.filter(o => o.side === 'buy');
+            // Solo abrir si es el par que toca en la rotación o si el scanner lo sugiere
+            // Para simplificar, si el loop principal nos pasa un símbolo, lo evaluamos.
+            // La rotación real se maneja en el Index o en un loop superior, 
+            // pero aquí validamos capital libre.
 
-                if (buys.length === 0) {
+            const ticker = await exchange.getTicker(symbol); // Polling inicial para entrada (REST OK)
+            const balances = await exchange.getBalance();
+            const quoteAsset = symbol.split('/')[1];
+            const quoteBal = balances.find((b: any) => b.asset === quoteAsset)?.free || 0;
+
+            if (quoteBal >= this.quoteAmount) {
+                const dummyStarter: VolumeStarter = {
+                    pair: symbol,
+                    volume24h: 0, volumeRank: 1, volumeVsAvgRatio: 1.5,
+                    spreadPct: (ticker.ask - ticker.bid) / ticker.bid,
+                    isPriorityPair: true, momentumPct: 0.01, timestamp: new Date()
+                };
+
+                const entryValidation = RiskGuard.validateEntry(dummyStarter, RISK_CONFIG);
+
+                if (entryValidation.allowed) {
                     signals.push({
                         symbol,
                         action: 'buy',
-                        strength: 80,
-                        reason: `Scalp Entry: Trending Coin.`,
-                        price: ticker.ask * 1.001,
-                        suggestedAmount: availableToSpend, // Spend BNB amount directly
+                        strength: 90,
+                        reason: `🌊 [DCA_ENTRY] Slot ${this.activePositions.size + 1}/${SCALING_CONFIG.MAX_CONCURRENT_PAIRS}`,
+                        price: ticker.ask,
+                        suggestedAmount: this.quoteAmount,
                         timestamp: new Date()
                     });
-                } else {
-                    // Check if Buy is stale (5 mins)
-                    for (const o of buys) {
-                        if ((now - new Date(o.createdAt).getTime()) > 5 * 60 * 1000) {
-                            signals.push({
-                                symbol,
-                                action: 'cancel_replace',
-                                strength: 100,
-                                reason: `Stale Buy (${o.id}): Repricing...`,
-                                price: ticker.ask, // New price
-                                suggestedAmount: availableToSpend / ticker.ask,
-                                timestamp: new Date()
-                            });
-                        }
-                    }
                 }
-            } else {
-                // Muted: console.log(`[Strategy] Insufficient Balance for ${symbol}: ${quoteBal.toFixed(2)} ${quote}`);
-                signals.push({
-                    symbol,
-                    action: 'hold',
-                    strength: 5,
-                    reason: `Insufficient Allocation: ${availableToSpend.toFixed(4)} ${quote} < ${MIN_NOTIONAL} (Min). Total Free: ${quoteBal.toFixed(4)}`,
-                    price: ticker.last,
-                    suggestedAmount: 0,
-                    timestamp: new Date()
-                });
             }
         }
 
@@ -969,71 +898,139 @@ export class ActiveScalperStrategy implements Strategy {
     }
 
     async execute(exchange: Exchange, signal: Signal): Promise<Order | null> {
+        const now = Date.now();
+
         if (signal.action === 'buy') {
-            this.lastBuyTime = Date.now();
-            this.lastBuyPrice = signal.price;
-            this.saveState();
-        }
+            const tradeId = `TRD_${now}_${signal.symbol.replace('/', '')}`;
+            
+            // 1. Ejecutar orden con RateLimiter
+            await this.rateLimiter.waitIfNecessary(RATE_LIMIT_CONFIG.WEIGHTS.CREATE_ORDER);
+            const order = await exchange.createOrder({
+                symbol: signal.symbol,
+                side: 'buy',
+                type: 'market',
+                amount: signal.suggestedAmount || this.quoteAmount,
+                price: signal.price
+            });
 
-        // Logic check: If reason contains 'TIMEOUT' or 'STOP LOSS', use MARKET order
-        const isEmergency = signal.reason.includes('TIMEOUT') || signal.reason.includes('STOP LOSS') || signal.reason.includes('Stale Buy');
-        const type = isEmergency ? 'market' : 'limit';
+            if (order) {
+                const snapshot: PositionSnapshot & { ttpState: TTPState } = {
+                    tradeId,
+                    pair: signal.symbol,
+                    state: TradeState.ENTERED,
+                    entryPrice: order.price || signal.price,
+                    currentPrice: order.price || signal.price,
+                    peakProfitPct: 0,
+                    currentProfitPct: 0,
+                    holdDurationMinutes: 0,
+                    entryReason: 'ROUND_ROBIN_ENTRY',
+                    openedAt: new Date(now),
+                    targetActivated: false,
+                    trailingArmed: false,
+                    ttpState: this.ttp.initState()
+                };
 
-        // If it's a Limit Buy, be aggressive? Or just Market.
-        // For Scalping, Market is preferred for Entry to ensure we catch the move.
-        // Let's use Market for Buy and Limit for Target Sell.
-        // Unless it's a Stale Reprice, then Market.
+                this.activePositions.set(tradeId, snapshot);
+                this.saveState();
 
-        // Final decision:
-        // Buy: Market (Speed)
-        // Sell (Target): Limit
-        // Sell (Timeout/Stop): Market
+                // Journal Entry
+                this.journal.recordEntry({
+                    tradeId,
+                    pair: signal.symbol,
+                    entryReason: 'ROUND_ROBIN_ENTRY',
+                    entryPrice: snapshot.entryPrice,
+                    entryTime: snapshot.openedAt.toISOString(),
+                    targetActivated: false,
+                    trailingArmed: false,
+                    peakProfitPct: 0,
+                    trailingExitTriggerPct: EXIT_CONFIG.TRAILING_PULLBACK_PCT,
+                    feePct: 0.0015,
+                    slippagePct: 0,
+                    holdDurationMinutes: 0,
+                    marketCondition: 'unknown'
+                });
+            }
+            return order;
 
-        // SAFETY GUARD: Binance rejects orders below minimum notional
-        // For BUY, suggestedAmount is already in Quote asset (BNB).
-        // For SELL, suggestedAmount is in Base asset (e.g. DOT), so we multiply by price.
-        const orderNotional = signal.action === 'buy' ? (signal.suggestedAmount || 0) : (signal.suggestedAmount || 0) * signal.price;
-        const quoteAsset = signal.symbol.split('/')[1];
-        const MIN_NOTIONAL_EXEC = quoteAsset === 'BNB' ? 0.010 : 5.0; // Subido a 0.010 para ADA/BNB y pares Top
-        if (orderNotional < MIN_NOTIONAL_EXEC) {
-            console.log(`[Strategy] Skipping ${signal.action.toUpperCase()} ${signal.symbol}: Notional ${orderNotional.toFixed(4)} ${quoteAsset} < ${MIN_NOTIONAL_EXEC} (dust)`);
-            // Reset state if it was a stale inventory entry
-            if (signal.action === 'sell') {
-                this.lastBuyPrice = 0;
-                this.lastBuyTime = 0;
-                this.highWaterMarkGain = 0;
+        } else if (signal.action === 'sell') {
+            const pos = Array.from(this.activePositions.values()).find(p => p.pair === signal.symbol);
+            if (!pos) return null;
+
+            // En v2.2 obtenemos el balance real para evitar error de cantidad 0
+            const balances = await exchange.getBalance();
+            const asset = signal.symbol.split('/')[0];
+            const balance = balances.find((b: any) => b.asset === asset);
+            const qty = balance?.free || 0;
+
+            if (qty <= 0) {
+                console.error(`[Strategy] ❌ No hay saldo de ${asset} para vender.`);
+                // Si no hay saldo, limpiamos la posición para no quedar en bucle
+                this.activePositions.delete(pos.tradeId);
+                this.saveState();
+                return null;
+            }
+
+            // 1. Ejecutar orden con RateLimiter
+            await this.rateLimiter.waitIfNecessary(RATE_LIMIT_CONFIG.WEIGHTS.CREATE_ORDER);
+            const order = await exchange.createOrder({
+                symbol: signal.symbol,
+                side: 'sell',
+                type: 'market',
+                amount: qty, 
+                price: signal.price
+            });
+
+            if (order) {
+                const exitReason: ExitReason = signal.reason.includes('TIMEOUT') ? 'MAX_HOLD_TIMEOUT' : 
+                                             signal.reason.includes('TRAILING') ? 'TRAILING_EXIT' : 'MANUAL';
+
+                this.journal.recordExit(pos.tradeId, {
+                    exitReason,
+                    exitPrice: order.price || signal.price,
+                    exitTime: new Date(now).toISOString(),
+                    finalProfitPct: pos.currentProfitPct,
+                    peakProfitPct: pos.peakProfitPct,
+                    holdDurationMinutes: pos.holdDurationMinutes
+                });
+
+                this.activePositions.delete(pos.tradeId);
                 this.saveState();
             }
-            return null;
+            return order;
         }
 
-        // LIVE BALANCE CHECK (before BUY): Prevents race condition where 2 bots
-        // both analyzed the same BNB balance and try to spend it simultaneously.
-        if (signal.action === 'buy') {
-            try {
-                const liveBalances = await exchange.getBalance();
-                const quoteAssetName = signal.symbol.split('/')[1];
-                const liveBal = liveBalances.find((b: any) => b.asset === quoteAssetName);
-                const liveQuoteFree = liveBal ? liveBal.free : 0;
-                if (liveQuoteFree < this.quoteAmount) {
-                    console.log(`[Strategy] ⏸ Skipping BUY ${signal.symbol}: Live balance ${liveQuoteFree.toFixed(6)} ${quoteAssetName} < ${this.quoteAmount} needed. Waiting for funds.`);
-                    return null;
-                }
-            } catch (e) {
-                // If balance check fails, proceed anyway (conservative)
-            }
-        }
-
-        return exchange.createOrder({
-            symbol: signal.symbol,
-            side: signal.action as 'buy' | 'sell',
-            type: 'market',
-            amount: signal.suggestedAmount || 0,
-            price: signal.price  // Needed for quoteOrderQty calculation on market buys
-        });
+        return null;
     }
 
     getMaxPositionSize(portfolio: Portfolio): number { return this.quoteAmount; }
-    getStopLoss(entry: number): number { return entry * (1 - this.stopLossPercent); }
-    getTakeProfit(entry: number): number { return entry * (1 + this.profitTargetPercent); }
+
+    /**
+     * Adopts an existing position (e.g., from startup recovery or manual trade)
+     */
+    public adoptPosition(pair: string, currentPrice: number) {
+        // Check if already tracking this pair
+        const existing = Array.from(this.activePositions.values()).find(p => p.pair === pair);
+        if (existing) return;
+
+        const tradeId = `RECOVERY_${Date.now()}_${pair.replace('/', '')}`;
+        const snapshot: any = {
+            tradeId,
+            pair,
+            state: 'ENTERED',
+            entryPrice: currentPrice, // We don't know the real entry, so we use current market price
+            currentPrice: currentPrice,
+            peakProfitPct: 0,
+            currentProfitPct: 0,
+            holdDurationMinutes: 0,
+            entryReason: 'VOLUME_SPIKE_PRIORITY', // Use a standard reason for UI compatibility
+            openedAt: new Date(),
+            targetActivated: false,
+            trailingArmed: false,
+            ttpState: (this as any).ttp.initState()
+        };
+
+        this.activePositions.set(tradeId, snapshot);
+        this.saveState();
+        console.log(`[Strategy] ♻️ Adopted position for ${pair} at ${currentPrice}`);
+    }
 }

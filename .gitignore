@@ -14,10 +14,15 @@ dashboard-ui/dist/
 data/
 *.db
 *.db-journal
+scalper_state*.json
 
 # Logs
 logs/
 *.log
+
+# Temporary / Local
+scratch/
+backups/
 
 # OS generated files
 .DS_Store

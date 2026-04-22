@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const key = process.env.BINANCE_API_KEY || '';
-const secret = process.env.BINANCE_API_SECRET || '';
+const secret = process.env.BINANCE_SECRET || '';
 
 console.log(`Checking Binance balances...`);
 
