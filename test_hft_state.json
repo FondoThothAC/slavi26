@@ -1,0 +1,24 @@
+{
+  "tickets": [
+    {
+      "id": "9hrnc6",
+      "symbol": "BTC/USDT",
+      "buyPrice": 65006.5,
+      "targetPrice": 66306.63,
+      "amount": 0.00015383077076907694,
+      "timestamp": 1773657350429,
+      "status": "sold"
+    },
+    {
+      "id": "652ij9",
+      "symbol": "ETH/USDT",
+      "buyPrice": 3500.35,
+      "targetPrice": 3570.357,
+      "amount": 0.0028568571714257147,
+      "timestamp": 1773657351543,
+      "status": "filled"
+    }
+  ],
+  "currentSymbolIndex": 2,
+  "updatedAt": "2026-03-16T10:35:51.546Z"
+}

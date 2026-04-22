@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BitsoAuto + Binance Trading Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="app-container">
+        <header>
+            <div class="logo">
+                <span class="logo-icon">⚡</span>
+                <h1>Bitso<span class="highlight">Auto</span></h1>
+            </div>
+            <div class="global-status">
+                <span id="connection-status" class="status-dot"></span> System Online
+            </div>
+        </header>
+
+        <main>
+            <!-- Combined Balance Hero -->
+            <section class="balance-hero">
+                <div class="balance-header">
+                    <span class="balance-label">Tu Saldo Total (Todas las Plataformas)</span>
+                    <h2 class="balance-total" id="total-balance">$0.00 <span class="currency-label">USD</span></h2>
+                    <p class="balance-subtitle" id="balance-change">Cargando...</p>
+                    <p id="bot-manager-status" style="margin-top: 10px; font-size: 0.9rem; font-weight: 600; color: var(--accent);"></p>
+                </div>
+            </section>
+
+            <!-- Exchange Summary Cards -->
+            <section class="currency-section">
+                <div class="currency-grid" style="grid-template-columns: repeat(2, 1fr);">
+                    <!-- Binance Card -->
+                    <div class="currency-card" style="border-left: 3px solid #f3ba2f;">
+                        <span class="currency-icon">🔶</span>
+                        <span class="currency-name">BINANCE</span>
+                        <div class="currency-amount" id="binance-total">$0.00</div>
+                        <div class="pnl-container" id="binance-pnl-container">
+                            <div class="pnl-row"><span>24h:</span> <span id="binance-pnl-24h">...</span></div>
+                            <div class="pnl-row"><span>1w:</span> <span id="binance-pnl-7d">...</span></div>
+                            <div class="pnl-row"><span>1m:</span> <span id="binance-pnl-30d">...</span></div>
+                        </div>
+                    </div>
+                    <!-- Bitso Card -->
+                    <div class="currency-card" style="border-left: 3px solid #6366f1;">
+                        <span class="currency-icon">⚡</span>
+                        <span class="currency-name">BITSO</span>
+                        <div class="currency-amount" id="bitso-total">$0.00</div>
+                        <div class="pnl-container" id="bitso-pnl-container">
+                            <div class="pnl-row"><span>24h:</span> <span id="bitso-pnl-24h">...</span></div>
+                            <div class="pnl-row"><span>1w:</span> <span id="bitso-pnl-7d">...</span></div>
+                            <div class="pnl-row"><span>1m:</span> <span id="bitso-pnl-30d">...</span></div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Binance Assets -->
+            <section class="currency-section">
+                <h2 class="section-title">Binance 🔶</h2>
+                <div class="currency-grid" id="binance-grid">
+                    <div class="currency-card loading"><div class="loading-spinner"></div><p>Cargando...</p></div>
+                </div>
+            </section>
+
+            <!-- Bitso Assets -->
+            <section class="currency-section">
+                <h2 class="section-title">Bitso ⚡</h2>
+                <div class="currency-grid" id="bitso-grid">
+                    <div class="currency-card loading"><p>Sin activos en Bitso</p></div>
+                </div>
+            </section>
+
+            <!-- Trade History -->
+            <section class="control-panel" id="trade-history-section">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                    <h2 style="margin: 0;">Historial de Trades (Binance Bot)</h2>
+                    <div id="trade-history-pnl" style="font-weight: 600; font-size: 0.95rem;"></div>
+                </div>
+                <div id="trade-history" style="max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.85rem;">
+                    <p style="color: var(--text-muted);">Cargando historial...</p>
+                </div>
+            </section>
+
+            <section class="control-panel">
+                <h2>Deploy New Agent</h2>
+                <form id="create-agent-form">
+                    <div class="input-group">
+                        <label>Strategy</label>
+                        <select id="strategy-type" required>
+                            <option value="maker-maker">Maker-Maker (Spread)</option>
+                            <option value="maker-taker">Maker-Taker (Trend)</option>
+                            <option value="elevador-chino">Elevador Chino (Grid)</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label>Book</label>
+                        <input type="text" id="book" value="btc_usd" required placeholder="e.g. btc_usd">
+                    </div>
+                    <div class="input-group">
+                        <label>Amount (USD/BTC)</label>
+                        <input type="text" id="amount" value="10" required placeholder="10">
+                    </div>
+                    <!-- Dynamic fields could go here -->
+                    <div class="input-group">
+                        <label>Spread / Min Profit %</label>
+                        <input type="text" id="spread" value="0.5" required placeholder="0.5">
+                    </div>
+                    <button type="submit" class="btn-primary">Deploy Agent</button>
+                </form>
+            </section>
+
+            <section class="control-panel">
+                <h2>Backtest Simulation (Jan-Nov 2025)</h2>
+                <form id="backtest-form">
+                    <div class="input-group">
+                        <label>Strategy</label>
+                        <select id="bt-strategy" required>
+                            <option value="maker-maker">Maker-Maker</option>
+                            <option value="maker-taker">Maker-Taker</option>
+                            <option value="elevador-chino">Elevador Chino</option>
+                            <option value="triangular-arbitrage">Triangular Arbitrage (Multi-Pair)</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label>Start Date</label>
+                        <input type="date" id="bt-start" value="2025-01-01">
+                    </div>
+                    <div class="input-group">
+                        <label>End Date</label>
+                        <input type="date" id="bt-end" value="2025-11-30">
+                    </div>
+                    <button type="submit" class="btn-primary" style="background: var(--warning)">Run Backtest</button>
+                </form>
+                <div id="backtest-results" style="margin-top: 1rem; display:none;">
+                    <h3>Results</h3>
+                    <p>Final Equity: <span id="bt-equity"></span></p>
+                    <p>Total Trades: <span id="bt-trades"></span></p>
+                    <!-- Chart placeholder -->
+                    <canvas id="equityChart" width="400" height="200"></canvas>
+                </div>
+            </section>
+
+            <section class="agents-grid" id="agents-container">
+                <!-- Agent Cards will be injected here -->
+                <div class="agent-card empty-state">
+                    <p>No active agents. Deploy one to start trading.</p>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="app.js"></script>
+</body>
+
+</html>

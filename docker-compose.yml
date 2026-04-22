@@ -1,0 +1,34 @@
+# SLAVI Trading Bot - Docker Compose
+services:
+  slavi-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: slavi-trading-bot
+    restart: unless-stopped
+    ports:
+      - "3333:3333"
+    environment:
+      - NODE_ENV=production
+      - DASHBOARD_PORT=3333
+      # Add your API keys here or use .env file
+      - BITSO_API_KEY=${BITSO_API_KEY:-}
+      - BITSO_API_SECRET=${BITSO_API_SECRET:-}
+      - BINANCE_API_KEY=${BINANCE_API_KEY:-}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET:-}
+    env_file:
+      - .env
+    volumes:
+      # PERSISTENT LOGS - survive container restarts!
+      - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - slavi-network
+
+networks:
+  slavi-network:
+    driver: bridge

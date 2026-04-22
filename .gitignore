@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+dashboard-ui/node_modules/
+
+# Environment variables
+.env
+.env.local
+
+# Build outputs
+dist/
+dashboard-ui/dist/
+
+# Data
+data/
+*.db
+*.db-journal
+
+# Logs
+logs/
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/

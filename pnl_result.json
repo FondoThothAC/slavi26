@@ -1,0 +1,57 @@
+{
+  "bnb_usd_price": 642.67,
+  "pnl_24h_bnb": 0,
+  "pnl_24h_usd": 0.0,
+  "trades_24h": 0,
+  "trade_details": [],
+  "balances": [
+    {
+      "asset": "ETH",
+      "free": 2.26e-05,
+      "locked": 0.0,
+      "total": 2.26e-05
+    },
+    {
+      "asset": "BNB",
+      "free": 0.00332631,
+      "locked": 0.0,
+      "total": 0.00332631
+    },
+    {
+      "asset": "USDT",
+      "free": 0.58576331,
+      "locked": 0.0,
+      "total": 0.58576331
+    },
+    {
+      "asset": "XRP",
+      "free": 0.0901,
+      "locked": 0.0,
+      "total": 0.0901
+    },
+    {
+      "asset": "FET",
+      "free": 0.0,
+      "locked": 27.7,
+      "total": 27.7
+    },
+    {
+      "asset": "MXN",
+      "free": 50.0,
+      "locked": 0.0,
+      "total": 50.0
+    },
+    {
+      "asset": "SOL",
+      "free": 0.00053831,
+      "locked": 0.071,
+      "total": 0.07153831
+    },
+    {
+      "asset": "FDUSD",
+      "free": 0.15344,
+      "locked": 0.0,
+      "total": 0.15344
+    }
+  ]
+}

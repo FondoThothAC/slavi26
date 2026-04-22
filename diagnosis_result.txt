@@ -1,0 +1,69 @@
+=== DIAGNOSE BINANCE ACCOUNT ===
+Time: 2026-02-26T02:57:57.060Z
+
+--- BALANCES ---
+  BTC: free=0.00000975 locked=0 total=0.00000975 ~$0.67
+  ETH: free=0.0000822 locked=0 total=0.0000822 ~$0.17
+  BNB: free=3e-7 locked=0 total=3e-7 ~$0.00
+  USDT: free=11.98928467 locked=0 total=11.98928467 ~$11.99
+  XRP: free=0.0901 locked=0 total=0.0901 ~$0.13
+  MXN: free=50 locked=0 total=50 ~$0.00
+  SOL: free=0.00987 locked=0 total=0.00987 ~$0.87
+  FDUSD: free=0.15344 locked=0 total=0.15344 ~$0.15
+
+  TOTAL: $13.98
+
+--- OPEN ORDERS ---
+  (none)
+
+--- RECENT LOG ENTRIES ---
+  [2026-02-26T00:45:07.044Z] 🔭 Scanning Market for Opportunities (Top 10 Volume)...
+  [2026-02-26T00:45:07.656Z] 🔥 Top Trends: BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT, USD1/USDT, DOGE/USDT, BNB/USDT, ADA/US
+  [2026-02-26T00:45:07.657Z] 🤖 Active Bots: BTC/USDT, ETH/USDT, SOL/USDT
+  [2026-02-26T01:00:07.053Z] 🔭 Scanning Market for Opportunities (Top 10 Volume)...
+  [2026-02-26T01:00:07.664Z] 🔥 Top Trends: BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT, USD1/USDT, DOGE/USDT, BNB/USDT, ADA/US
+  [2026-02-26T01:00:07.665Z] 🤖 Active Bots: BTC/USDT, ETH/USDT, SOL/USDT
+  [2026-02-26T01:02:11.573Z] 💰 [ETH/USDT] EXECUTING: SELL - TIMEOUT (30m): Unstucking capital. Selling at Market.
+  [2026-02-26T01:02:12.001Z] 💰 [SOL/USDT] EXECUTING: BUY - Scalp Entry: Trending Coin.
+  [2026-02-26T01:04:17.045Z] 🧹 STARTUP RECOVERY: Checking for stuck orders...
+  [2026-02-26T01:04:17.047Z] [INFO] [SYSTEM] Running Startup Recovery
+  [2026-02-26T01:04:18.494Z] 🔭 Scanning Market for Opportunities (Top 10 Volume)...
+  [2026-02-26T01:04:19.040Z] 🔥 Top Trends: BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT, USD1/USDT, DOGE/USDT, BNB/USDT, ADA/US
+  [2026-02-26T01:04:19.041Z] ✨ Spawning Bot for BTC/USDT
+  [2026-02-26T01:04:19.041Z] ✨ Spawning Bot for BTC/USDT
+  [2026-02-26T01:04:19.042Z] ✨ Spawning Bot for ETH/USDT
+  [2026-02-26T01:04:19.044Z] ✨ Spawning Bot for ETH/USDT
+  [2026-02-26T01:04:19.046Z] ✨ Spawning Bot for SOL/USDT
+  [2026-02-26T01:04:19.046Z] ✨ Spawning Bot for SOL/USDT
+  [2026-02-26T01:04:19.048Z] 🤖 Active Bots: BTC/USDT, ETH/USDT, SOL/USDT
+  [2026-02-26T01:18:24.197Z] 🧹 STARTUP RECOVERY: Checking for stuck orders...
+  [2026-02-26T01:18:24.200Z] [INFO] [SYSTEM] Running Startup Recovery
+  [2026-02-26T01:18:25.474Z] 🔭 Scanning Market for Opportunities (Top 10 Volume)...
+  [2026-02-26T01:18:25.893Z] 🔥 Top Trends: BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT, USD1/USDT, DOGE/USDT, BNB/USDT, ADA/US
+  [2026-02-26T01:18:25.894Z] ✨ Spawning Bot for BTC/USDT
+  [2026-02-26T01:18:25.894Z] ✨ Spawning Bot for BTC/USDT
+  [2026-02-26T01:18:25.897Z] ✨ Spawning Bot for ETH/USDT
+  [2026-02-26T01:18:25.897Z] ✨ Spawning Bot for ETH/USDT
+  [2026-02-26T01:18:25.899Z] ✨ Spawning Bot for SOL/USDT
+  [2026-02-26T01:18:25.899Z] ✨ Spawning Bot for SOL/USDT
+  [2026-02-26T01:18:25.901Z] 🤖 Active Bots: BTC/USDT, ETH/USDT, SOL/USDT
+  [2026-02-26T01:32:15.599Z] 💰 [SOL/USDT] EXECUTING: SELL - TIMEOUT (30m): Unstucking capital. Selling at Market.
+  [2026-02-26T01:32:20.074Z] 💰 [BTC/USDT] EXECUTING: BUY - Scalp Entry: Trending Coin.
+  [2026-02-26T01:33:28.478Z] 🔭 Scanning Market for Opportunities (Top 10 Volume)...
+  [2026-02-26T01:33:29.105Z] 🔥 Top Trends: BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT, USD1/USDT, DOGE/USDT, BNB/USDT, ADA/US
+  [2026-02-26T01:33:29.106Z] 🤖 Active Bots: BTC/USDT, ETH/USDT, SOL/USDT
+  [2026-02-26T01:48:28.489Z] 🔭 Scanning Market for Opportunities (Top 10 Volume)...
+  [2026-02-26T01:48:29.127Z] 🔥 Top Trends: BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT, USD1/USDT, DOGE/USDT, BNB/USDT, ADA/US
+  [2026-02-26T01:48:29.128Z] 🤖 Active Bots: BTC/USDT, ETH/USDT, SOL/USDT
+  [2026-02-26T02:02:23.428Z] 💰 [BTC/USDT] EXECUTING: SELL - TIMEOUT (30m): Unstucking capital. Selling at Market.
+  [2026-02-26T02:02:23.831Z] 💰 [ETH/USDT] EXECUTING: BUY - Scalp Entry: Trending Coin.
+  [2026-02-26T02:03:28.493Z] 🔭 Scanning Market for Opportunities (Top 10 Volume)...
+  [2026-02-26T02:03:28.989Z] 🔥 Top Trends: BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT, USD1/USDT, DOGE/USDT, BNB/USDT, ADA/US
+  [2026-02-26T02:03:28.990Z] 🤖 Active Bots: BTC/USDT, ETH/USDT, SOL/USDT
+  [2026-02-26T02:18:28.499Z] 🔭 Scanning Market for Opportunities (Top 10 Volume)...
+  [2026-02-26T02:18:29.020Z] 🔥 Top Trends: BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT, USD1/USDT, DOGE/USDT, BNB/USDT, ADA/US
+  [2026-02-26T02:18:29.021Z] 🤖 Active Bots: BTC/USDT, ETH/USDT, SOL/USDT
+  [2026-02-26T02:32:26.894Z] 💰 [ETH/USDT] EXECUTING: SELL - TIMEOUT (30m): Unstucking capital. Selling at Market.
+  [2026-02-26T02:33:28.505Z] 🔭 Scanning Market for Opportunities (Top 10 Volume)...
+  [2026-02-26T02:33:29.267Z] 🔥 Top Trends: BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT, USD1/USDT, DOGE/USDT, BNB/USDT, ADA/US
+  [2026-02-26T02:33:29.268Z] 🤖 Active Bots: BTC/USDT, ETH/USDT, SOL/USDT
