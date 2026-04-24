@@ -135,40 +135,7 @@ export class ProductionGridBot {
             this.dashboard.updatePrice(update.symbol, update.price);
         });
 
-        this.exchange.on('trailingStopHit', async (data) => {
-            console.log(`🎯 [WS EVENT] Trailing Stop Hit: ${data.symbol} @ ${data.price}`);
-            this.dashboard.log(`🎯 [TRAIL HIT] Selling ${data.symbol} @ ${data.price} (Peak: ${data.peak})`);
-            try {
-                // Fetch live balance
-                const balances = await this.exchange.getBalance();
-                const asset = data.symbol.split('/')[0];
-                const bal = balances.find((b: any) => b.asset === asset);
-                const amount = bal ? bal.free : 0;
-
-                if (amount <= 0) return;
-
-                const order = await this.exchange.createOrder({
-                    symbol: data.symbol,
-                    side: 'sell',
-                    type: 'market',
-                    amount: amount
-                });
-
-                await this.db.insertTrade({
-                    timestamp: new Date().toISOString(),
-                    exchange: 'Binance',
-                    symbol: data.symbol,
-                    side: 'SELL',
-                    price: order.price,
-                    amount: order.amount,
-                    total: order.price * order.amount,
-                    status: order.status,
-                    orderId: order.id
-                });
-            } catch (e: any) {
-                this.dashboard.log(`❌ [TRAIL SELL FAILED] ${data.symbol}: ${e.message}`);
-            }
-        });
+        // Trailing stops are now handled by ActiveScalperStrategy's TTP logic.
     }
 
     private async runFastIteration() {
@@ -288,9 +255,7 @@ export class ProductionGridBot {
                             orderId: order.id
                         });
                         
-                        if (order.side === 'buy' && (order.status === 'filled' || order.status === 'open')) {
-                            (this.exchange as any).registerPosition(bot.symbol, order.price || s.price);
-                        }
+                        // Position tracking is handled by ActiveScalperStrategy internally.
                     }
                 } else if ((s.action as any) === 'cancel_replace') {
                     const matchId = s.reason.match(/order ([a-zA-Z0-9_\-]+)/i) || s.reason.match(/\(([a-zA-Z0-9_\-]+)\)/);

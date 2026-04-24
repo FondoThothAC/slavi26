@@ -10,7 +10,7 @@ import { SCALING_CONFIG } from './ScalingConfig';
 
 export const CONFIG_SUMMARY = {
     strategy: "Refined Riding (Round-Robin Sequential Scalping)",
-    version: "2.2.0",
+    version: "2.2.2",
     initialTargetPct: EXIT_CONFIG.INITIAL_TARGET_PCT,
     trailingPullbackPct: EXIT_CONFIG.TRAILING_PULLBACK_PCT,
     maxHoldMinutes: RISK_CONFIG.MAX_HOLD_MINUTES,

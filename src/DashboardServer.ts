@@ -99,10 +99,13 @@ export class DashboardServer {
         } as GlobalKPIs,
         priceHistory: [] as { timestamp: number; exchange: string; price: number; marker?: 'buy' | 'sell' }[],
         recentTrades: [] as any[],
-        hodlMode: false
+        hodlMode: false,
+        portfolioHistory: [] as { timestamp: number; value: number }[]
     };
     private logsDir: string;
     private priceHistoryFile: string;
+    private portfolioHistoryFile: string;
+    private lastPortfolioSnapshot = 0;
     private app: any;
     private server: any;
     private io: any;
@@ -112,10 +115,14 @@ export class DashboardServer {
         this.port = port;
         this.logsDir = path.join(process.cwd(), 'logs');
         this.priceHistoryFile = path.join(this.logsDir, 'price_history.json');
+        this.portfolioHistoryFile = path.join(this.logsDir, 'portfolio_history.json');
 
         if (!fs.existsSync(this.logsDir)) {
             fs.mkdirSync(this.logsDir, { recursive: true });
         }
+
+        this.loadPriceHistory();
+        this.loadPortfolioHistory();
 
         this.app = express();
         this.server = http.createServer(this.app);
@@ -123,7 +130,6 @@ export class DashboardServer {
 
         this.setupRoutes();
         this.setupSockets();
-        this.loadPriceHistory();
     }
 
     public async start(tradeLogger?: any) {
@@ -169,6 +175,29 @@ export class DashboardServer {
         } catch (e) { }
     }
 
+    private loadPortfolioHistory() {
+        try {
+            if (fs.existsSync(this.portfolioHistoryFile)) {
+                const data = JSON.parse(fs.readFileSync(this.portfolioHistoryFile, 'utf8'));
+                this.stats.portfolioHistory = data.portfolioHistory || [];
+            }
+        } catch (e) { }
+    }
+
+    private savePortfolioHistory() {
+        try {
+            fs.writeFileSync(this.portfolioHistoryFile, JSON.stringify({
+                portfolioHistory: this.stats.portfolioHistory.slice(-500)
+            }));
+        } catch (e) { }
+    }
+
+    private recordPortfolioSnapshot(totalUSD: number) {
+        this.stats.portfolioHistory.push({ timestamp: Date.now(), value: totalUSD });
+        if (this.stats.portfolioHistory.length > 500) this.stats.portfolioHistory.shift();
+        this.savePortfolioHistory();
+    }
+
     recalculateTotalPortfolio(prices?: Map<string, number>) {
         let totalUSD = 0;
         if (prices) {
@@ -181,7 +210,12 @@ export class DashboardServer {
         const historyCopy = [...this.stats.priceHistory].reverse();
         const getPrice = (symbol: string) => {
             if (prices?.has(symbol)) return prices.get(symbol)!;
-            const hist = historyCopy.find((p: any) => p.exchange.includes(symbol));
+            const hist = historyCopy.find((p: any) => 
+                p.exchange === symbol || 
+                p.exchange === `${symbol}USDT` || 
+                p.exchange === `${symbol}/USDT` ||
+                p.exchange === `USDT${symbol}`
+            );
             return hist ? hist.price : 0;
         };
 
@@ -218,6 +252,14 @@ export class DashboardServer {
         this.stats.totalPortfolioBNB = (bnbPrice > 0 ? totalUSD / bnbPrice : 0).toFixed(4);
         this.stats.totalPortfolioMXN = (mxnUsd > 0 ? totalUSD / mxnUsd : 0).toFixed(2);
         this.stats.availablePortfolioValue = totalUSD.toFixed(2);
+
+        // Record portfolio snapshot every 5 minutes
+        const now = Date.now();
+        if (now - this.lastPortfolioSnapshot > 5 * 60 * 1000) {
+            this.lastPortfolioSnapshot = now;
+            this.recordPortfolioSnapshot(totalUSD);
+        }
+
         this.broadcastState();
     }
 
@@ -295,8 +337,8 @@ export class DashboardServer {
             const peakProfitPct = (Number(s?.peakProfitPct || 0)) * 100;
             const holdMinutes = Number(s?.holdDurationMinutes || 0);
             
-            // El target neto es 0.15% (0.30% bruto - 0.15% comisiones)
-            const targetProfitPct = 0.15;
+            // El target neto es 0.35% (0.50% bruto - 0.15% comisiones)
+            const targetProfitPct = 0.35;
 
             // Delta = Target - Current. Ej: 0.15 - (-0.15) = 0.30 (Falta un 0.30% para llegar)
             const deltaToTargetPct = targetProfitPct - currentProfitPct;
@@ -476,6 +518,13 @@ export class DashboardServer {
         </div>
     </div>
 
+    <div class="grid grid-full">
+        <div class="card">
+            <div class="card-title">📈 CAPITAL EVOLUTION (USD)</div>
+            <div class="chart-box"><canvas id="capitalChart"></canvas></div>
+        </div>
+    </div>
+
     <div class="grid">
         <div class="card grid-full">
             <div class="card-title">📜 RECENT TRANSACTIONS (TRADES.DB)</div>
@@ -547,6 +596,33 @@ export class DashboardServer {
                 scales: {
                     x: { type: 'linear', grid: { display: false }, ticks: { color: '#94a3b8', callback: v => new Date(v).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) } },
                     y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#94a3b8' } }
+                },
+                plugins: { legend: { display: false } }
+            }
+        });
+
+        const ctxCap = document.getElementById('capitalChart').getContext('2d');
+        const capHistory = ${JSON.stringify(this.stats.portfolioHistory.map((p: any) => ({ x: p.timestamp, y: p.value })))};
+        new Chart(ctxCap, {
+            type: 'line',
+            data: {
+                datasets: [{
+                    label: 'Portfolio Value (USD)',
+                    data: capHistory,
+                    borderColor: '#10b981',
+                    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+                    fill: true,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    borderWidth: 3
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: { type: 'linear', display: false },
+                    y: { beginAtZero: false, ticks: { color: '#10b981' } }
                 },
                 plugins: { legend: { display: false } }
             }

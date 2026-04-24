@@ -1,55 +1,70 @@
-import { EXIT_CONFIG } from '../config';
+import { EXIT_CONFIG } from '../config/ExitConfig';
 
 export interface TTPState {
     isActive: boolean;
-    peakProfitPct: number;
     targetActivated: boolean;
-    targetActivationPrice: number | null;
+    peakProfitPct: number;
 }
 
 /**
  * @description Motor puro para gestionar el Surfeo de ganancias independiente por Slot.
+ * Implementa un "Escudo" de ganancia neta mínima para evitar ventas por ruido de mercado.
  */
 export class TrailingTakeProfit {
-    
-    constructor(private readonly config: typeof EXIT_CONFIG) {}
+    constructor(private config: typeof EXIT_CONFIG) {}
 
     public initState(): TTPState {
-        return { isActive: false, peakProfitPct: 0, targetActivated: false, targetActivationPrice: null };
+        return {
+            isActive: false,
+            targetActivated: false,
+            peakProfitPct: -999
+        };
     }
 
-    public update(state: TTPState, currentProfitPct: number): TTPState {
+    public update(state: TTPState, currentNetProfitPct: number): TTPState {
         const newState = { ...state };
-        if (!newState.targetActivated && currentProfitPct >= this.config.INITIAL_TARGET_PCT) {
+
+        // 1. ¿Superamos el Target Inicial? (Calculamos el neto restando comisiones redondas)
+        const netTarget = this.config.INITIAL_TARGET_PCT - this.config.ROUND_TRIP_FEE_PCT; 
+        if (!newState.targetActivated && currentNetProfitPct >= netTarget) {
             newState.targetActivated = true;
-            newState.isActive = true;
-            newState.peakProfitPct = currentProfitPct;
+            newState.isActive = true; // Armamos el gatillo
+            newState.peakProfitPct = currentNetProfitPct;
         }
-        if (newState.isActive && currentProfitPct > newState.peakProfitPct) {
-            newState.peakProfitPct = currentProfitPct;
+
+        // 2. Si ya estamos "Riding", actualizar el pico máximo
+        if (newState.isActive) {
+            if (currentNetProfitPct > newState.peakProfitPct) {
+                newState.peakProfitPct = currentNetProfitPct;
+            }
         }
+
         return newState;
     }
 
-    public shouldExit(state: TTPState, currentProfitPct: number): boolean {
+    public shouldExit(state: TTPState, currentNetProfitPct: number): boolean {
+        // Si no está armado el trailing, no vender
         if (!state.isActive) return false;
-        // Interpretamos 0.10 como 0.10% absoluto si viene de config.
-        // Si el usuario puso 0.10 en config, restamos eso al pico.
-        return (state.peakProfitPct - currentProfitPct) >= this.config.TRAILING_PULLBACK_PCT;
+
+        // ¿El precio cayó más de lo permitido desde el pico?
+        const isPullbackHit = currentNetProfitPct <= (state.peakProfitPct - this.config.TRAILING_PULLBACK_PCT);
+        
+        // 🛡️ EL ESCUDO: ¿La ganancia sigue siendo mayor al piso mínimo garantizado?
+        const isAboveFloor = currentNetProfitPct >= this.config.MIN_NET_PROFIT_FLOOR_PCT;
+
+        // Vender SOLAMENTE si ocurrió el pullback Y todavía estamos por encima del piso seguro
+        return isPullbackHit && isAboveFloor;
     }
 
-    public getExitTriggerPrice(entryPrice: number, state: TTPState): number | null {
-        if (!state.isActive) return null;
-        return entryPrice * (1 + (state.peakProfitPct - this.config.TRAILING_PULLBACK_PCT));
+    public describe(state: TTPState): string {
+        if (state.isActive) {
+            return `TTP[riding|peak=${(state.peakProfitPct * 100).toFixed(2)}%|pullback=${(this.config.TRAILING_PULLBACK_PCT * 100).toFixed(2)}%]`;
+        }
+        return `TTP[inactive]`;
     }
 
     public getProfitAtExit(state: TTPState): number {
         if (!state.isActive) return 0;
         return state.peakProfitPct - this.config.TRAILING_PULLBACK_PCT;
-    }
-
-    public describe(state: TTPState): string {
-        if (!state.isActive) return `TTP[inactive]`;
-        return `TTP[riding|peak=${(state.peakProfitPct*100).toFixed(2)}%|pullback=${(this.config.TRAILING_PULLBACK_PCT*100).toFixed(2)}%]`;
     }
 }

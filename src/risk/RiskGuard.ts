@@ -1,5 +1,5 @@
 import { PositionSnapshot, VolumeStarter } from '../types';
-import { RISK_CONFIG } from '../config';
+import { RISK_CONFIG } from '../config/RiskConfig';
 
 /**
  * @description Evaluador puro de riesgos y condiciones de protección.

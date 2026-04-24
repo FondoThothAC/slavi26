@@ -32,7 +32,8 @@ export type ExitReason =
 export type EntryReason = 
     | 'VOLUME_SPIKE' 
     | 'PRIORITY_PAIR' 
-    | 'VOLUME_SPIKE_PRIORITY';
+    | 'VOLUME_SPIKE_PRIORITY'
+    | 'ROUND_ROBIN_ENTRY';
 
 /**
  * @description Snapshot del estado actual de una posición.
